@@ -488,10 +488,18 @@ fn generation_timestamp_ms(gen: &[u8], session_anchor: Option<i64>) -> Option<i6
 /// 3. the payload itself as 8 raw `fixed64`-style bytes, evaluating both
 ///    little-endian (protobuf's own byte order) and big-endian. When the
 ///    little-endian reading decodes as native milliseconds, a competing
-///    big-endian reading that only clears the window as an artifact of byte
-///    reversal in the nanoseconds branch is discarded in favor of the canonical
-///    LE milliseconds reading. Any other conflicting in-window endianness
-///    readings are rejected as ambiguous, falling back to the session stamp.
+///    big-endian reading that only decodes as an artifact of byte reversal in
+///    the nanoseconds branch is discarded in favor of the canonical LE
+///    milliseconds reading. Any other pair of conflicting plausible endianness
+///    readings is rejected as ambiguous, falling back to the session stamp.
+///
+///    The two byte orders are played off against each other on their unit
+///    ranges alone, *before* the session window is consulted. The window's
+///    upper bound is the scan clock, so letting it disqualify a competitor
+///    would make the same bytes read differently on different days: a reading
+///    that was unrivalled while its mirror still lay in the future would turn
+///    ambiguous — and the row would move back to the session stamp — the day
+///    the mirror caught up with the calendar.
 ///
 /// A raw IEEE-754 `f64` reading of the same 8 bytes is deliberately *not*
 /// attempted. It is the one candidate whose false-positive rate against a
@@ -511,9 +519,21 @@ fn generation_timestamp_ms(gen: &[u8], session_anchor: Option<i64>) -> Option<i6
 /// discarded rather than allowed to mask a later candidate. A payload with no
 /// trustworthy session anchor is declined outright.
 fn inferred_epoch_ms(payload: &[u8], session_anchor: Option<i64>) -> Option<i64> {
+    inferred_epoch_ms_at(
+        payload,
+        session_anchor,
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
+/// [`inferred_epoch_ms`] evaluated as of `now_ms` instead of the wall clock,
+/// so a test can hold the bytes and the anchor fixed and vary only the moment
+/// of the scan. `now_ms` closes the session window; the absolute
+/// [`plausible_epoch_ms`] horizon still reads the wall clock.
+fn inferred_epoch_ms_at(payload: &[u8], session_anchor: Option<i64>, now_ms: i64) -> Option<i64> {
     // Sampled once so every candidate for this payload is judged against the
     // same window, and so a missing anchor short-circuits before any decode.
-    let window = session_window_ms(session_anchor?)?;
+    let window = session_window_ms(session_anchor?, now_ms)?;
     let accepted = |ms: i64| window.contains(&ms);
 
     if let Some(ms) =
@@ -534,16 +554,23 @@ fn inferred_epoch_ms(payload: &[u8], session_anchor: Option<i64>) -> Option<i64>
         return Some(ms);
     }
     let raw: [u8; 8] = payload.try_into().ok()?;
-    let le = epoch_scalar_with_unit(u64::from_le_bytes(raw)).filter(|&(_, ms)| accepted(ms));
-    let be = epoch_scalar_with_unit(u64::from_be_bytes(raw)).filter(|&(_, ms)| accepted(ms));
-    match (le, be) {
+    // Settle the two byte orders against each other on unit ranges alone — a
+    // property of the bytes — and only then ask whether the survivor belongs to
+    // this session. The window must not take part in the contest: its upper
+    // bound moves with the clock, so a competitor it excludes today it admits
+    // tomorrow, and the verdict for unchanged bytes would drift with the scan
+    // date.
+    let le = epoch_scalar_with_unit(u64::from_le_bytes(raw));
+    let be = epoch_scalar_with_unit(u64::from_be_bytes(raw));
+    let settled = match (le, be) {
         (Some((_, le_ms)), Some((_, be_ms))) if le_ms == be_ms => Some(le_ms),
         (Some((EpochUnit::Millis, le_ms)), Some((EpochUnit::Nanos, _))) => Some(le_ms),
         (Some(_), Some(_)) => None,
         (Some((_, le_ms)), None) => Some(le_ms),
         (None, Some((_, be_ms))) => Some(be_ms),
         (None, None) => None,
-    }
+    };
+    settled.filter(|&ms| accepted(ms))
 }
 
 /// agy's "unset" marker for the `#9.#2` int64: -1, which reaches this wire
@@ -639,17 +666,15 @@ const FUTURE_TOLERANCE_MS: i64 = 60 * 60 * 1_000;
 /// 1.1.18 support existed, which is the correct outcome.
 ///
 /// Returns `None` when `session_created` is not positive — a decoded stamp of
-/// zero is no more of an anchor than a missing one. If the anchor is itself in
-/// the future the range comes out empty, which rejects every candidate for the
-/// same reason.
-fn session_window_ms(session_created: i64) -> Option<RangeInclusive<i64>> {
+/// zero is no more of an anchor than a missing one. If the anchor is itself
+/// past `now_ms` — the moment of the scan — the range comes out empty, which
+/// rejects every candidate for the same reason.
+fn session_window_ms(session_created: i64, now_ms: i64) -> Option<RangeInclusive<i64>> {
     if session_created <= 0 {
         return None;
     }
     let earliest = session_created.saturating_sub(SESSION_START_TOLERANCE_MS);
-    let latest = chrono::Utc::now()
-        .timestamp_millis()
-        .saturating_add(FUTURE_TOLERANCE_MS);
+    let latest = now_ms.saturating_add(FUTURE_TOLERANCE_MS);
     Some(earliest..=latest)
 }
 
@@ -1397,11 +1422,17 @@ mod tests {
     /// sentinel sitting next to it.
     #[test]
     fn agy_1_1_18_gen9_field_10_dates_the_turn() {
-        let seconds = recent_epoch_seconds();
+        // Pinned rather than clock-derived. The raw-byte cases below read the
+        // same eight bytes in both orders, and for a few percent of
+        // clock-derived stamps the mirror reading is itself a plausible time —
+        // an ambiguity the parser declines by design, which would fail this
+        // test on those days. None of this stamp's mirrors is a time, in any
+        // unit, and the loop asserts as much so a change to the constant cannot
+        // reintroduce the flake. A stamp in the past cannot drift out of either
+        // window, since both only ever extend forward.
+        let seconds = 1_781_502_653_i64; // 2026-06-15, build_trajectory_meta
         let expected_ms = seconds * 1_000;
-        // Anchor the session shortly before the turn so the session window matches
-        // real-world sessions and does not unnaturally widen to invite
-        // endianness ambiguity across months.
+        // Anchor the session shortly before the turn, as a real session would be.
         let session_fallback = expected_ms - 60_000;
         let sentinel = enc_varint(2, u64::MAX);
 
@@ -1442,6 +1473,12 @@ mod tests {
             );
 
             // (3) the payload itself as 8 raw fixed64-style bytes.
+            assert_eq!(
+                epoch_scalar_with_unit(scalar.swap_bytes()),
+                None,
+                "the {unit} fixture's mirror reading must not be a time, or this \
+                 case exercises the ambiguity rule instead of the {unit} decode"
+            );
             for (order, raw) in [
                 ("little-endian", scalar.to_le_bytes()),
                 ("big-endian", scalar.to_be_bytes()),
@@ -1493,6 +1530,52 @@ mod tests {
             gen9_timestamp(&gen9_2, wide_session_fallback),
             wide_session_fallback,
             "competing in-window endianness readings must fall back to session timestamp"
+        );
+    }
+
+    /// The verdict on a raw payload must not depend on the day of the scan.
+    /// The window's upper bound is the clock, so if the two byte orders were
+    /// played off against each other *inside* the window, a payload whose
+    /// mirror reading still lay in the future would be dated by its unrivalled
+    /// reading today and rejected as ambiguous once the calendar caught up with
+    /// the mirror — moving the row back to the session stamp, and out of every
+    /// `--since` report that had contained it. Same bytes, same anchor, two
+    /// clocks: one verdict.
+    #[test]
+    fn competing_endianness_verdict_does_not_depend_on_the_scan_clock() {
+        const HOUR_MS: i64 = 60 * 60 * 1_000;
+        const DAY_MS: i64 = 24 * HOUR_MS;
+        // The second #1256 collision: big-endian millis for 2026-09-01, whose
+        // little-endian mirror reads as nanoseconds for 2026-06-16.
+        let raw = 1_788_274_719_000_u64.to_be_bytes();
+        assert_eq!(raw, [0x00, 0x00, 0x01, 0xa0, 0x5d, 0x7a, 0xb9, 0x18]);
+        let anchor = 1_781_502_653_000_i64; // 2026-06-15, build_trajectory_meta
+
+        let le = epoch_scalar_with_unit(u64::from_le_bytes(raw));
+        let be = epoch_scalar_with_unit(u64::from_be_bytes(raw));
+        assert_eq!(le, Some((EpochUnit::Nanos, 1_781_589_670_136)));
+        assert_eq!(be, Some((EpochUnit::Millis, 1_788_274_719_000)));
+        let (le_ms, be_ms) = (le.unwrap().1, be.unwrap().1);
+
+        // Scanned the day after the LE reading, with the BE reading still
+        // months out: only LE is inside the window.
+        let before_mirror = le_ms + DAY_MS;
+        assert!(
+            be_ms > before_mirror + FUTURE_TOLERANCE_MS,
+            "the BE reading must still be in the future for the first clock"
+        );
+        // Scanned once both readings are in the past.
+        let after_mirror = be_ms + DAY_MS;
+
+        let verdicts = [before_mirror, after_mirror]
+            .map(|now_ms| inferred_epoch_ms_at(&raw, Some(anchor), now_ms));
+        assert_eq!(
+            verdicts[0], verdicts[1],
+            "the same bytes must date the turn the same way on both scan days"
+        );
+        assert_eq!(
+            verdicts[1], None,
+            "two plausible readings that disagree are ambiguous whether or not the window has admitted both yet"
         );
     }
 
@@ -1765,9 +1848,10 @@ mod tests {
             );
         }
 
-        assert!(session_window_ms(0).is_none());
-        assert!(session_window_ms(-1).is_none());
-        assert!(session_window_ms(1).is_some());
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        assert!(session_window_ms(0, now_ms).is_none());
+        assert!(session_window_ms(-1, now_ms).is_none());
+        assert!(session_window_ms(1, now_ms).is_some());
     }
 
     /// The anchor has to come from `trajectory_metadata_blob`, never from the
@@ -1821,7 +1905,7 @@ mod tests {
             let mtime = file_modified_ms(path);
             assert!(mtime > 0, "the fixture must have a positive mtime");
             assert!(
-                session_window_ms(mtime)
+                session_window_ms(mtime, chrono::Utc::now().timestamp_millis())
                     .expect("a positive mtime does build a window")
                     .contains(&would_pass_under_mtime),
                 "the payload has to be one an mtime-anchored window would have \
