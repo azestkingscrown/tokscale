@@ -486,20 +486,28 @@ fn generation_timestamp_ms(gen: &[u8], session_anchor: Option<i64>) -> Option<i6
 /// 2. a nested message holding the epoch scalar in field 1, as a varint or as a
 ///    `fixed64`;
 /// 3. the payload itself as 8 raw `fixed64`-style bytes, evaluating both
-///    little-endian (protobuf's own byte order) and big-endian. When the
-///    little-endian reading decodes as native milliseconds, a competing
-///    big-endian reading that only decodes as an artifact of byte reversal in
-///    the nanoseconds branch is discarded in favor of the canonical LE
-///    milliseconds reading. Any other pair of conflicting plausible endianness
-///    readings is rejected as ambiguous, falling back to the session stamp.
+///    little-endian (protobuf's own byte order) and big-endian. When the two
+///    readings disagree, the little-endian one wins if the big-endian one only
+///    decodes in a *finer* unit — that competitor is the arithmetic shadow of
+///    the LE reading rather than an independent interpretation, because
+///    reversing an 8-byte value moves its zero padding to the bottom and its
+///    low bytes to the top, so a short (coarse-unit) value can only ever mirror
+///    into a longer (finer-unit) band, never the other way round. Any other
+///    pair of conflicting plausible readings is rejected as ambiguous, falling
+///    back to the session stamp: when the LE reading is the finer one, its
+///    mirror landing in a coarser band means the LE value's low bytes are zero,
+///    which is exactly what a genuine big-endian write of a shorter value looks
+///    like, and both hypotheses stay live.
 ///
 ///    The two byte orders are played off against each other on their unit
-///    ranges alone, *before* the session window is consulted. The window's
-///    upper bound is the scan clock, so letting it disqualify a competitor
-///    would make the same bytes read differently on different days: a reading
-///    that was unrivalled while its mirror still lay in the future would turn
+///    ranges alone, *before* the session window is consulted, and the
+///    plausibility band those ranges are cut from is a fixed [2020, 2100]
+///    bracket that never reads the clock. Either clock input would make the
+///    same bytes read differently on different days: a reading that was
+///    unrivalled while its mirror still lay beyond the horizon would turn
 ///    ambiguous — and the row would move back to the session stamp — the day
-///    the mirror caught up with the calendar.
+///    the horizon reached the mirror. The scan clock enters exactly once,
+///    closing the session window around the survivor.
 ///
 /// A raw IEEE-754 `f64` reading of the same 8 bytes is deliberately *not*
 /// attempted. It is the one candidate whose false-positive rate against a
@@ -528,8 +536,9 @@ fn inferred_epoch_ms(payload: &[u8], session_anchor: Option<i64>) -> Option<i64>
 
 /// [`inferred_epoch_ms`] evaluated as of `now_ms` instead of the wall clock,
 /// so a test can hold the bytes and the anchor fixed and vary only the moment
-/// of the scan. `now_ms` closes the session window; the absolute
-/// [`plausible_epoch_ms`] horizon still reads the wall clock.
+/// of the scan. `now_ms` is the only clock the verdict reads: it closes the
+/// session window, while the absolute [`plausible_epoch_ms`] band is fixed,
+/// so identical bytes and anchor yield one verdict on every scan day.
 fn inferred_epoch_ms_at(payload: &[u8], session_anchor: Option<i64>, now_ms: i64) -> Option<i64> {
     // Sampled once so every candidate for this payload is judged against the
     // same window, and so a missing anchor short-circuits before any decode.
@@ -555,16 +564,26 @@ fn inferred_epoch_ms_at(payload: &[u8], session_anchor: Option<i64>, now_ms: i64
     }
     let raw: [u8; 8] = payload.try_into().ok()?;
     // Settle the two byte orders against each other on unit ranges alone — a
-    // property of the bytes — and only then ask whether the survivor belongs to
-    // this session. The window must not take part in the contest: its upper
-    // bound moves with the clock, so a competitor it excludes today it admits
+    // property of the bytes, because plausible_epoch_ms is a fixed bracket
+    // that never reads the clock — and only then ask whether the survivor
+    // belongs to this session. No clock-dependent gate may take part in the
+    // contest: a competitor a moving horizon excludes today it admits
     // tomorrow, and the verdict for unchanged bytes would drift with the scan
-    // date.
+    // date. A ceiling of now+5y was that same drift deferred, not removed: a
+    // dated row was withdrawn to the session stamp the day the horizon
+    // reached its mirror.
+    //
+    // The tie-break covers every coarse-LE pairing, not just millis-over-nanos.
+    // Byte reversal maps short values to long ones, so a genuine LE reading in
+    // seconds, millis or micros mirrors into a finer band whenever it mirrors
+    // into one at all; treating those as live competitors undated real turns.
     let le = epoch_scalar_with_unit(u64::from_le_bytes(raw));
     let be = epoch_scalar_with_unit(u64::from_be_bytes(raw));
     let settled = match (le, be) {
         (Some((_, le_ms)), Some((_, be_ms))) if le_ms == be_ms => Some(le_ms),
-        (Some((EpochUnit::Millis, le_ms)), Some((EpochUnit::Nanos, _))) => Some(le_ms),
+        (Some((le_unit, le_ms)), Some((be_unit, _))) if be_unit.is_finer_than(le_unit) => {
+            Some(le_ms)
+        }
         (Some(_), Some(_)) => None,
         (Some((_, le_ms)), None) => Some(le_ms),
         (None, Some((_, be_ms))) => Some(be_ms),
@@ -578,12 +597,28 @@ fn inferred_epoch_ms_at(payload: &[u8], session_anchor: Option<i64>, now_ms: i64
 /// before any unit detection can promote it into a date.
 const UNSET_TIME_SENTINEL: u64 = u64::MAX;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// The unit an epoch scalar was read in. Declared coarsest-first, and the
+/// derived `Ord` is load-bearing: [`EpochUnit::is_finer_than`] is the whole
+/// tie-break in the endianness contest, so reordering these variants would
+/// silently change which reading wins.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum EpochUnit {
     Seconds,
     Millis,
     Micros,
     Nanos,
+}
+
+impl EpochUnit {
+    /// Whether `self` resolves time more finely than `other`.
+    ///
+    /// Over the plausible band a unit fixes a value's byte length: seconds need
+    /// four significant bytes, milliseconds six, microseconds seven,
+    /// nanoseconds all eight. So "finer" is equivalently "longer", which is
+    /// what makes this a statement about the bytes and not about time.
+    fn is_finer_than(self, other: Self) -> bool {
+        self > other
+    }
 }
 
 fn epoch_scalar_with_unit(value: u64) -> Option<(EpochUnit, i64)> {
@@ -615,17 +650,21 @@ fn epoch_scalar_to_ms(value: u64) -> Option<i64> {
 }
 
 /// Whether an epoch-ms value is believable as an Antigravity CLI generation
-/// time: no earlier than 2020-01-01 (the CLI did not exist) and no further than
-/// five years ahead of now (that is clock skew or a misread field, not a turn).
+/// time: no earlier than 2020-01-01 (the CLI did not exist) and no later than
+/// 2100-01-01. Both bounds are fixed constants — deliberately *not* the wall
+/// clock — so plausibility is a property of the bytes alone and the
+/// endianness contest built on it cannot change its verdict as the calendar
+/// advances. The ceiling only ever disqualifies artifacts: every acceptance
+/// path also applies the session window, whose upper bound is the scan
+/// moment, so a genuine turn never comes near 2100, and 2100 is near enough
+/// that the four unit ranges stay disjoint (see [`epoch_scalar_to_ms`]).
 fn plausible_epoch_ms(ms: i64) -> bool {
     /// 2020-01-01T00:00:00Z in epoch ms.
     const MIN_MS: i64 = 1_577_836_800_000;
-    const FIVE_YEARS_MS: i64 = 5 * 365 * 24 * 60 * 60 * 1_000;
+    /// 2100-01-01T00:00:00Z in epoch ms.
+    const MAX_MS: i64 = 4_102_444_800_000;
 
-    let max_ms = chrono::Utc::now()
-        .timestamp_millis()
-        .saturating_add(FIVE_YEARS_MS);
-    (MIN_MS..=max_ms).contains(&ms)
+    (MIN_MS..=MAX_MS).contains(&ms)
 }
 
 /// How far *before* the session-created stamp an inferred generation time may
@@ -1422,14 +1461,20 @@ mod tests {
     /// sentinel sitting next to it.
     #[test]
     fn agy_1_1_18_gen9_field_10_dates_the_turn() {
-        // Pinned rather than clock-derived. The raw-byte cases below read the
-        // same eight bytes in both orders, and for a few percent of
-        // clock-derived stamps the mirror reading is itself a plausible time —
-        // an ambiguity the parser declines by design, which would fail this
-        // test on those days. None of this stamp's mirrors is a time, in any
-        // unit, and the loop asserts as much so a change to the constant cannot
-        // reintroduce the flake. A stamp in the past cannot drift out of either
-        // window, since both only ever extend forward.
+        // Pinned rather than clock-derived, and the pin is required by the
+        // raw-byte cases below rather than by any weakness in the contest.
+        // They read the same eight bytes in both orders; for the micros and
+        // nanos scalars the byte-reversed mirror is itself a plausible time in
+        // a coarser-or-equal unit, which is genuine ambiguity the parser
+        // declines by design. Sweeping 200_000 consecutive clock-derived
+        // stamps, that hits 0.88% of micros and 3.58% of nanos samples —
+        // 4.46% of runs would fail. (The seconds and millis scalars are stable
+        // at 0.000%: their mirrors are always finer, so the tie-break keeps
+        // them.) None of this stamp's mirrors is a time in any unit, and the
+        // loop asserts as much, so a change to the constant cannot reintroduce
+        // the flake. A stamp in the past cannot drift out of the fixed
+        // plausibility bracket, and the session window only ever extends
+        // forward.
         let seconds = 1_781_502_653_i64; // 2026-06-15, build_trajectory_meta
         let expected_ms = seconds * 1_000;
         // Anchor the session shortly before the turn, as a real session would be.
@@ -1541,6 +1586,13 @@ mod tests {
     /// the mirror — moving the row back to the session stamp, and out of every
     /// `--since` report that had contained it. Same bytes, same anchor, two
     /// clocks: one verdict.
+    ///
+    /// This covers the *session window* specifically — the only clock left in
+    /// `inferred_epoch_ms_at` — by varying `now_ms`, which is all `now_ms`
+    /// reaches. The plausibility bracket the contest is cut from takes no clock
+    /// at all; that half is pinned by
+    /// [`a_mirror_beyond_the_old_horizon_cannot_enter_the_contest_late`], which
+    /// scans one payload at clocks twenty-five years apart.
     #[test]
     fn competing_endianness_verdict_does_not_depend_on_the_scan_clock() {
         const HOUR_MS: i64 = 60 * 60 * 1_000;
@@ -1579,6 +1631,146 @@ mod tests {
         );
     }
 
+    /// One raw `#9.#10` payload, its two readings, and the single verdict it
+    /// must produce on every scan day.
+    struct EndiannessCase {
+        raw: [u8; 8],
+        anchor: i64,
+        turn_ms: i64,
+        le: Option<(EpochUnit, i64)>,
+        be: Option<(EpochUnit, i64)>,
+        verdict: Option<i64>,
+    }
+
+    /// Assert both readings decode as stated, then scan the payload at the turn
+    /// itself and a day, a month, a year, five and twenty-five years later,
+    /// requiring one verdict throughout. Clocks *before* the turn are left out
+    /// only because the bytes cannot be on disk yet.
+    fn assert_one_verdict_at_every_clock(cases: &[EndiannessCase]) {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+        const YEAR_MS: i64 = 365 * DAY_MS;
+
+        for case in cases {
+            assert_eq!(
+                epoch_scalar_with_unit(u64::from_le_bytes(case.raw)),
+                case.le,
+                "LE reading of {:02x?}",
+                case.raw
+            );
+            assert_eq!(
+                epoch_scalar_with_unit(u64::from_be_bytes(case.raw)),
+                case.be,
+                "BE reading of {:02x?}",
+                case.raw
+            );
+            for elapsed in [0, DAY_MS, 30 * DAY_MS, YEAR_MS, 5 * YEAR_MS, 25 * YEAR_MS] {
+                assert_eq!(
+                    inferred_epoch_ms_at(&case.raw, Some(case.anchor), case.turn_ms + elapsed),
+                    case.verdict,
+                    "raw {:02x?} scanned {elapsed} ms after the turn",
+                    case.raw
+                );
+            }
+        }
+    }
+
+    /// The band the contest cuts its unit ranges from is a fixed bracket, so a
+    /// mirror reading can never *enter* the contest as the calendar advances —
+    /// the failure of the `now + 5y` ceiling it replaced.
+    ///
+    /// Both payloads below are ordinary big-endian millisecond turns written
+    /// 512 ms apart in one session on 2026-09-06, whose little-endian mirrors
+    /// read as nanoseconds for 2031-09-08 and 2031-09-02. Under the old ceiling
+    /// — `now + 5y`, which on the day this was written stood at 2031-09-06 —
+    /// the first mirror was still beyond it and the second already inside, so
+    /// the first payload was dated and the second declined: same session, same
+    /// shape, opposite verdicts, decided by nothing but the wall clock. The
+    /// first would then have been withdrawn to the session stamp two days
+    /// later, dropping out of every `--since 2026-09-06` report that held it.
+    /// Under the fixed bracket the mirror is a competitor at every clock, so
+    /// both are declined on every scan day.
+    #[test]
+    fn a_mirror_beyond_the_old_horizon_cannot_enter_the_contest_late() {
+        assert_one_verdict_at_every_clock(&[
+            EndiannessCase {
+                raw: [0x00, 0x00, 0x01, 0xa0, 0x78, 0xf4, 0x03, 0x1b],
+                anchor: 1_788_734_000_000,
+                turn_ms: 1_788_735_652_635,
+                le: Some((EpochUnit::Nanos, 1_946_668_262_871)),
+                be: Some((EpochUnit::Millis, 1_788_735_652_635)),
+                verdict: None,
+            },
+            EndiannessCase {
+                raw: [0x00, 0x00, 0x01, 0xa0, 0x78, 0xf4, 0x01, 0x1b],
+                anchor: 1_788_734_000_000,
+                turn_ms: 1_788_735_652_123,
+                le: Some((EpochUnit::Nanos, 1_946_105_312_918)),
+                be: Some((EpochUnit::Millis, 1_788_735_652_123)),
+                verdict: None,
+            },
+        ]);
+    }
+
+    /// A big-endian reading in a *finer* unit than the little-endian one is the
+    /// byte-reversal shadow of that reading, not a rival to it, and must never
+    /// cost the row its date.
+    ///
+    /// Reversing eight bytes sends a value's zero padding to the bottom and its
+    /// low bytes to the top, so a seconds, millis or micros reading — four, six
+    /// or seven significant bytes — mirrors into a longer, finer band whenever
+    /// it mirrors into a band at all. Cutting the contest from a fixed bracket
+    /// instead of a five-year horizon makes far more of those shadows
+    /// plausible, so a tie-break naming only millis-over-nanos undated 13.7% of
+    /// genuine little-endian second turns (swept over calendar 2026, 37 s
+    /// apart) that both `main` and #1287 date. Every payload here is declined
+    /// by that narrower rule and dated by this one.
+    #[test]
+    fn a_finer_unit_mirror_never_unseats_the_little_endian_reading() {
+        assert_one_verdict_at_every_clock(&[
+            // Little-endian *second* turns one second apart on 2026-06-14,
+            // whose big-endian mirrors read as nanoseconds for 2020-02-01 and
+            // 2022-05-15 — both inside even the old five-year horizon, so this
+            // pair was undated from day one, not at some future clock.
+            EndiannessCase {
+                raw: 1_781_395_221_u64.to_le_bytes(),
+                anchor: 1_781_395_221_000 - 60_000,
+                turn_ms: 1_781_395_221_000,
+                le: Some((EpochUnit::Seconds, 1_781_395_221_000)),
+                be: Some((EpochUnit::Nanos, 1_580_531_927_520)),
+                verdict: Some(1_781_395_221_000),
+            },
+            EndiannessCase {
+                raw: 1_781_395_222_u64.to_le_bytes(),
+                anchor: 1_781_395_222_000 - 60_000,
+                turn_ms: 1_781_395_222_000,
+                le: Some((EpochUnit::Seconds, 1_781_395_222_000)),
+                be: Some((EpochUnit::Nanos, 1_652_589_521_558)),
+                verdict: Some(1_781_395_222_000),
+            },
+            // A little-endian *microsecond* turn with a nanosecond mirror: the
+            // same shadow one unit up, which the millis-only rule also missed.
+            EndiannessCase {
+                raw: 1_781_395_200_000_022_u64.to_le_bytes(),
+                anchor: 1_781_395_200_000 - 60_000,
+                turn_ms: 1_781_395_200_000,
+                le: Some((EpochUnit::Micros, 1_781_395_200_000)),
+                be: Some((EpochUnit::Nanos, 1_639_338_182_377)),
+                verdict: Some(1_781_395_200_000),
+            },
+            // Control: a genuine little-endian millisecond turn whose mirror is
+            // not a time in any unit. Unrivalled at every clock, so the
+            // tie-break never runs and the row keeps its own date.
+            EndiannessCase {
+                raw: 1_781_502_653_000_u64.to_le_bytes(),
+                anchor: 1_781_502_653_000 - 60_000,
+                turn_ms: 1_781_502_653_000,
+                le: Some((EpochUnit::Millis, 1_781_502_653_000)),
+                be: None,
+                verdict: Some(1_781_502_653_000),
+            },
+        ]);
+    }
+
     /// Genuine little-endian millisecond payloads must still date the turn even
     /// when the session window is wide enough that the byte-reversed integer
     /// decodes as nanoseconds in-window (~1.2% of genuine LE millisecond values).
@@ -1609,7 +1801,6 @@ mod tests {
     #[test]
     fn unrecognised_gen9_payloads_fall_back_to_the_session_timestamp() {
         let session_fallback = 1_781_502_653_000_i64;
-        let seconds = recent_epoch_seconds();
 
         // The unset sentinel alone, exactly as agy 1.1.18 writes `#9.#2`.
         assert_eq!(
@@ -1636,9 +1827,12 @@ mod tests {
             "an opaque 8-byte #10 must fall back rather than produce a date"
         );
 
-        // Right shape, wrong window — in both directions.
+        // Right shape, wrong window — in both directions. Both pinned: a
+        // clock-derived far value could drift back inside the fixed
+        // plausibility band, and its byte-reversed mirror could decode as an
+        // in-window date, changing which gate does the rejecting.
         let stale = 631_152_000_u64; // 1990-01-01, before the CLI existed
-        let far_future = (seconds + 10 * 365 * 24 * 60 * 60) as u64;
+        let far_future = 7_258_118_400_u64; // 2200-01-01, past the 2100 ceiling
         for bogus in [stale, far_future] {
             assert_eq!(
                 gen9_timestamp(&enc_len(10, &bogus.to_le_bytes()), session_fallback),
