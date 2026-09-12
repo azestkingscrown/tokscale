@@ -87,18 +87,20 @@ pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
     //
     // Quiet: a database without `gen_metadata` is not an Antigravity CLI
     // database at all, so there is nothing to warn about.
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut rows: Vec<(i64, Vec<u8>)> = Vec::new();
     sqlite_for_each_row_on(
         &conn,
         path,
-        "SELECT data FROM gen_metadata ORDER BY idx",
+        "SELECT idx, data FROM gen_metadata ORDER BY idx",
         None,
         &mut |row| {
-            blobs.push(row.get::<_, Vec<u8>>(0)?);
+            let idx = row.get::<_, Option<i64>>(0)?.unwrap_or(rows.len() as i64);
+            let data: Vec<u8> = row.get(1)?;
+            rows.push((idx, data));
             Ok(())
         },
     );
-    let session_models = SessionModels::from_blobs(&blobs);
+    let session_models = SessionModels::from_blobs(rows.iter().map(|(_, blob)| blob.as_slice()));
     let ctx = GenContext {
         session_id: &session_id,
         session_timestamp: meta.fallback_ms,
@@ -109,13 +111,12 @@ pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
 
     let mut messages = Vec::new();
     let mut seen_response_ids: HashSet<String> = HashSet::new();
-    for (gen_idx, blob) in blobs.iter().enumerate() {
+    for (gen_idx, blob) in &rows {
         // `fallback_ms` is the per-row timestamp fallback; each row prefers its
         // own per-generation wall-clock stamp (see `parse_gen_metadata`).
         // `created_ms` travels separately because only a genuinely decoded
         // session created-at may anchor the inferred 1.1.18 reading.
-        if let Some(mut message) =
-            parse_gen_metadata(blob, &ctx, &mut seen_response_ids, gen_idx as i64)
+        if let Some(mut message) = parse_gen_metadata(blob, &ctx, &mut seen_response_ids, *gen_idx)
         {
             if meta.workspace_key.is_some() {
                 message.set_workspace(meta.workspace_key.clone(), meta.workspace_label.clone());
@@ -158,7 +159,7 @@ struct SessionModels {
 }
 
 impl SessionModels {
-    fn from_blobs(blobs: &[Vec<u8>]) -> Self {
+    fn from_blobs<'a>(blobs: impl IntoIterator<Item = &'a [u8]>) -> Self {
         let mut by_display: HashMap<&str, Option<&str>> = HashMap::new();
         let mut distinct: HashSet<&str> = HashSet::new();
         let mut unresolved_labels: Vec<&str> = Vec::new();
@@ -2673,6 +2674,76 @@ mod tests {
         conn.execute(
             "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 15, ?1)",
             params![build_step_meta(turn2_seconds, "resp-step-2")],
+        )
+        .unwrap();
+
+        let messages = parse_antigravity_cli_file(&path);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].timestamp, turn1_seconds * 1_000);
+        assert_eq!(messages[1].timestamp, turn2_seconds * 1_000);
+        assert!(messages.iter().all(|m| m.timestamp != session_created_ms));
+    }
+
+    #[test]
+    fn steps_table_dates_modern_agy_turns_by_gen_idx_with_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("steps-gap-timestamp.db");
+
+        let session_created_ms = 1_781_502_653_000_i64;
+        let turn1_seconds = 1_789_200_000_i64;
+        let turn2_seconds = 1_789_217_157_i64;
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gen_metadata (idx integer, data blob, size integer);
+             CREATE TABLE trajectory_metadata_blob (id text, data blob);
+             CREATE TABLE steps (idx integer, step_type integer, metadata blob);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+            params![build_trajectory_meta()],
+        )
+        .unwrap();
+
+        let cache_metadata = enc_len(10, b"cache metadata payload that is not a timestamp");
+        let row1 = build_row_with_gen9(&cache_metadata, "");
+        let row2 = build_row_with_gen9(&cache_metadata, "");
+
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data, size) VALUES (3, ?1, 0)",
+            params![row1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data, size) VALUES (7, ?1, 0)",
+            params![row2],
+        )
+        .unwrap();
+
+        let build_step_meta_by_idx = |seconds: i64, gen_idx: u64| {
+            let mut ts = Vec::new();
+            ts.extend(enc_varint(1, seconds as u64));
+            ts.extend(enc_varint(2, 0));
+
+            let mut meta20 = Vec::new();
+            meta20.extend(enc_varint(3, gen_idx));
+
+            let mut meta = Vec::new();
+            meta.extend(enc_len(1, &ts));
+            meta.extend(enc_len(20, &meta20));
+            meta
+        };
+
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (1, 15, ?1)",
+            params![build_step_meta_by_idx(turn1_seconds, 3)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 15, ?1)",
+            params![build_step_meta_by_idx(turn2_seconds, 7)],
         )
         .unwrap();
 
