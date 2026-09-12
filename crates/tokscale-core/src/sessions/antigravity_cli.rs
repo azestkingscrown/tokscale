@@ -87,14 +87,14 @@ pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
     //
     // Quiet: a database without `gen_metadata` is not an Antigravity CLI
     // database at all, so there is nothing to warn about.
-    let mut rows: Vec<(i64, Vec<u8>)> = Vec::new();
+    let mut rows: Vec<(Option<i64>, Vec<u8>)> = Vec::new();
     sqlite_for_each_row_on(
         &conn,
         path,
         "SELECT idx, data FROM gen_metadata ORDER BY idx",
         None,
         &mut |row| {
-            let idx = row.get::<_, Option<i64>>(0)?.unwrap_or(rows.len() as i64);
+            let idx = row.get::<_, Option<i64>>(0)?;
             let data: Vec<u8> = row.get(1)?;
             rows.push((idx, data));
             Ok(())
@@ -289,7 +289,7 @@ fn parse_gen_metadata(
     blob: &[u8],
     ctx: &GenContext<'_>,
     seen_response_ids: &mut HashSet<String>,
-    gen_idx: i64,
+    gen_idx: Option<i64>,
 ) -> Option<UnifiedMessage> {
     let chat_model = message_field(blob, 1)?;
     let usage = message_field(chat_model, 4)?;
@@ -333,7 +333,7 @@ fn parse_gen_metadata(
                 .as_deref()
                 .and_then(|id| ctx.step_timestamps.by_response_id.get(id).copied())
         })
-        .or_else(|| ctx.step_timestamps.by_gen_idx.get(&gen_idx).copied())
+        .or_else(|| gen_idx.and_then(|idx| ctx.step_timestamps.by_gen_idx.get(&idx).copied()))
         .unwrap_or(ctx.session_timestamp);
 
     let response_model = non_empty_string_field(chat_model, 19);
@@ -1071,7 +1071,7 @@ mod tests {
             session_models: &models,
             step_timestamps: &step_timestamps,
         };
-        parse_gen_metadata(&build_row_with_gen9(gen9, "resp"), &ctx, &mut seen, 0)
+        parse_gen_metadata(&build_row_with_gen9(gen9, "resp"), &ctx, &mut seen, None)
             .expect("row parses")
             .timestamp
     }
@@ -1094,7 +1094,7 @@ mod tests {
             session_models: &models,
             step_timestamps: &step_timestamps,
         };
-        parse_gen_metadata(blob, &ctx, seen_response_ids, 0)
+        parse_gen_metadata(blob, &ctx, seen_response_ids, None)
     }
 
     fn build_gen_metadata() -> Vec<u8> {
