@@ -7899,7 +7899,28 @@ mod tests {
         let expected_azure = (272_000.0 * 0.000010 + 28_000.0 * 0.000020) + (10_000.0 * 0.000050); // $3.78
         assert!((azure_cost - expected_azure).abs() < 1e-12);
 
-        // 6. Complete LiteLLM pricing preference is favored for openai provider
+        // 6. Multi-call aggregate: ceiling division evaluates per-call threshold
+        // total_input = 544_000 with calls = 2 (average 272_000) uses base rates
+        let at_boundary_multi = compute_cost_for_lookup_with_calls(
+            &result,
+            Some("openai"),
+            &usage(544_000, 20_000, 0, 0),
+            2,
+        );
+        let expected_at_boundary_multi = 544_000.0 * 0.000010 + 20_000.0 * 0.000050;
+        assert!((at_boundary_multi - expected_at_boundary_multi).abs() < 1e-12);
+
+        // total_input = 544_001 with calls = 2 (average > 272_000) selects above-272k rates
+        let above_boundary_multi = compute_cost_for_lookup_with_calls(
+            &result,
+            Some("openai"),
+            &usage(544_001, 20_000, 0, 0),
+            2,
+        );
+        let expected_above_boundary_multi = 544_001.0 * 0.000020 + 20_000.0 * 0.000075;
+        assert!((above_boundary_multi - expected_above_boundary_multi).abs() < 1e-12);
+
+        // 7. Complete LiteLLM pricing preference is favored for openai provider
         assert!(should_prefer_openai_tiered_litellm(
             "gpt-6-astra",
             Some("openai"),
