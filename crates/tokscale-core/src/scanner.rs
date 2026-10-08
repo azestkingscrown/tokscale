@@ -814,8 +814,8 @@ pub fn built_in_extra_scan_paths_for(
         };
 
         if use_env_roots {
-            let env_session_dir =
-                std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty());
+            let env_session_dir = std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR")
+                .filter(|path| !path.to_string_lossy().trim().is_empty());
             if let Some(path) = &env_session_dir {
                 paths.push((ClientId::Senpi, PathBuf::from(path)));
             }
@@ -847,8 +847,8 @@ pub fn built_in_extra_scan_paths_for(
             if let Some(path) = &env_session_dir {
                 sessions_roots.push(PathBuf::from(path));
             }
-            if let Some(env_omo_session_dir) =
-                std::env::var_os("OMO_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty())
+            if let Some(env_omo_session_dir) = std::env::var_os("OMO_CODING_AGENT_SESSION_DIR")
+                .filter(|path| !path.to_string_lossy().trim().is_empty())
             {
                 let path = PathBuf::from(env_omo_session_dir);
                 paths.push((ClientId::Senpi, path.clone()));
@@ -3065,6 +3065,20 @@ mod tests {
         extra.remove("TOKSCALE_EXTRA_DIRS");
         extra.remove("TOKSCALE_HEADLESS_DIR");
         scan_all_clients(home_dir, clients)
+    }
+
+    fn senpi_test_env_guard() -> EnvGuard {
+        let mut env = EnvGuard::capture(&[
+            "SENPI_CODING_AGENT_DIR",
+            "SENPI_CODING_AGENT_SESSION_DIR",
+            "OMO_CODING_AGENT_DIR",
+            "OMO_CODING_AGENT_SESSION_DIR",
+        ]);
+        env.remove("SENPI_CODING_AGENT_DIR");
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("OMO_CODING_AGENT_DIR");
+        env.remove("OMO_CODING_AGENT_SESSION_DIR");
+        env
     }
 
     fn restore_env(var: &str, previous: Option<String>) {
@@ -5594,7 +5608,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_scan_all_clients_senpi() {
+        let _env = senpi_test_env_guard();
         let dir = TempDir::new().unwrap();
         let home = dir.path();
         setup_mock_senpi_dir(home);
@@ -8202,8 +8218,7 @@ mod tests {
     #[serial]
     fn test_senpi_omo_task_children_root_uses_native_separators() {
         let project_dir = TempDir::new().unwrap();
-        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR"]);
-        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        let _env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(project_dir.path());
         let enabled = HashSet::from([ClientId::Senpi]);
 
@@ -8328,10 +8343,7 @@ mod tests {
         let home_dir = TempDir::new().unwrap();
         let other_dir = TempDir::new().unwrap();
         let child_session = setup_mock_senpi_omo_child(home_dir.path());
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
-        env.remove("SENPI_CODING_AGENT_DIR");
-        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        let _env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(other_dir.path());
 
         let result =
@@ -8354,8 +8366,7 @@ mod tests {
         let child_session = setup_mock_senpi_omo_child(home_dir.path());
         let project_children = project_dir.path().join(".omo/senpi-task/children");
         let redirected_agent = TempDir::new().unwrap();
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
+        let mut env = senpi_test_env_guard();
         env.set("SENPI_CODING_AGENT_DIR", redirected_agent.path());
         env.set("SENPI_CODING_AGENT_SESSION_DIR", &project_children);
         let _current_dir = CurrentDirGuard::set(project_dir.path());
@@ -8382,9 +8393,7 @@ mod tests {
         let other_dir = TempDir::new().unwrap();
         let child_session = setup_mock_senpi_omo_child(home_dir.path());
         let children_dir = home_dir.path().join(".omo/senpi-task/children");
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
-        env.remove("SENPI_CODING_AGENT_DIR");
+        let mut env = senpi_test_env_guard();
         env.set("SENPI_CODING_AGENT_SESSION_DIR", &children_dir);
         let _current_dir = CurrentDirGuard::set(other_dir.path());
         let enabled = HashSet::from([ClientId::Senpi]);
@@ -8416,10 +8425,7 @@ mod tests {
         let home_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
         let child_session = setup_mock_senpi_omo_child(project_dir.path());
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
-        env.remove("SENPI_CODING_AGENT_DIR");
-        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        let _env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(project_dir.path());
 
         let result =
@@ -8443,9 +8449,7 @@ mod tests {
         let redirected_sessions = TempDir::new().unwrap();
         let redirected_session = redirected_sessions.path().join("redirected.jsonl");
         File::create(&redirected_session).unwrap();
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
-        env.remove("SENPI_CODING_AGENT_DIR");
+        let mut env = senpi_test_env_guard();
         env.set("SENPI_CODING_AGENT_SESSION_DIR", redirected_sessions.path());
         let _current_dir = CurrentDirGuard::set(project_dir.path());
 
@@ -8471,9 +8475,7 @@ mod tests {
         let children_dir = project_dir.path().join(".omo/senpi-task/children");
         let task_dir = children_dir.join("task-123");
         let exact_session_dir = task_dir.join("sessions/task-123");
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
-        env.remove("SENPI_CODING_AGENT_DIR");
+        let mut env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(project_dir.path());
 
         for env_root in [
@@ -8512,9 +8514,7 @@ mod tests {
             &symlink_root,
         )
         .unwrap();
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_DIR", "SENPI_CODING_AGENT_SESSION_DIR"]);
-        env.remove("SENPI_CODING_AGENT_DIR");
+        let mut env = senpi_test_env_guard();
         env.set("SENPI_CODING_AGENT_SESSION_DIR", &symlink_root);
         let _current_dir = CurrentDirGuard::set(project_dir.path());
 
@@ -8563,10 +8563,7 @@ mod tests {
             "2026-08-31T00-00-00-000Z_global.jsonl",
             project_dir.path(),
         );
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
-        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
-        env.remove("SENPI_CODING_AGENT_DIR");
+        let _env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(elsewhere.path());
 
         let result =
@@ -8622,16 +8619,7 @@ mod tests {
             "2026-08-31T00-00-00-000Z_omo.jsonl",
             project_dir.path(),
         );
-        let mut env = EnvGuard::capture(&[
-            "SENPI_CODING_AGENT_SESSION_DIR",
-            "SENPI_CODING_AGENT_DIR",
-            "OMO_CODING_AGENT_SESSION_DIR",
-            "OMO_CODING_AGENT_DIR",
-        ]);
-        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
-        env.remove("SENPI_CODING_AGENT_DIR");
-        env.remove("OMO_CODING_AGENT_SESSION_DIR");
-        env.remove("OMO_CODING_AGENT_DIR");
+        let _env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(elsewhere.path());
 
         let result =
@@ -8674,16 +8662,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut env = EnvGuard::capture(&[
-            "SENPI_CODING_AGENT_SESSION_DIR",
-            "SENPI_CODING_AGENT_DIR",
-            "OMO_CODING_AGENT_SESSION_DIR",
-            "OMO_CODING_AGENT_DIR",
-        ]);
-        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
-        env.remove("SENPI_CODING_AGENT_DIR");
-        env.remove("OMO_CODING_AGENT_SESSION_DIR");
-        env.remove("OMO_CODING_AGENT_DIR");
+        let _env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(elsewhere.path());
 
         let mut settings = ScannerSettings::default();
@@ -8716,6 +8695,72 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_senpi_honors_omo_coding_agent_session_dir() {
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(project_dir.path());
+        let redirected_sessions = TempDir::new().unwrap();
+        let redirected_session = redirected_sessions.path().join("redirected.jsonl");
+        File::create(&redirected_session).unwrap();
+        let mut env = senpi_test_env_guard();
+        env.set("OMO_CODING_AGENT_SESSION_DIR", redirected_sessions.path());
+        let _current_dir = CurrentDirGuard::set(project_dir.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let canonical_files: HashSet<PathBuf> = result
+            .get(ClientId::Senpi)
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert_eq!(canonical_files.len(), 2);
+        assert!(canonical_files.contains(&child_session));
+        assert!(canonical_files.contains(&redirected_session.canonicalize().unwrap()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_honors_omo_coding_agent_dir() {
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let custom_agent = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(project_dir.path());
+        let custom_session = custom_agent
+            .path()
+            .join("sessions")
+            .join("--project--")
+            .join("2026-08-31T00-00-00-000Z_omo.jsonl");
+        fs::create_dir_all(custom_session.parent().unwrap()).unwrap();
+        fs::write(
+            &custom_session,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"test\",\"timestamp\":\"2026-08-31T00:00:00.000Z\",\"cwd\":{}}}\n",
+                json_path_literal(project_dir.path())
+            ),
+        )
+        .unwrap();
+
+        let mut env = senpi_test_env_guard();
+        env.set("OMO_CODING_AGENT_DIR", custom_agent.path());
+        let _current_dir = CurrentDirGuard::set(elsewhere.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let canonical_files: HashSet<PathBuf> = result
+            .get(ClientId::Senpi)
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert!(canonical_files.contains(&child_session));
+        assert!(canonical_files.contains(&custom_session.canonicalize().unwrap()));
+        assert_eq!(canonical_files.len(), 2);
+    }
+
+    #[test]
+    #[serial]
     fn test_senpi_global_sessions_ignore_projects_without_children() {
         let home_dir = TempDir::new().unwrap();
         let bare_project = TempDir::new().unwrap();
@@ -8726,10 +8771,7 @@ mod tests {
             "2026-08-31T00-00-00-000Z_bare.jsonl",
             bare_project.path(),
         );
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
-        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
-        env.remove("SENPI_CODING_AGENT_DIR");
+        let _env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(elsewhere.path());
 
         let result =
@@ -8759,10 +8801,7 @@ mod tests {
             "2026-08-31T00-00-00-000Z_global.jsonl",
             project_dir.path(),
         );
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
-        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
-        env.remove("SENPI_CODING_AGENT_DIR");
+        let _env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(project_dir.path());
 
         let result =
@@ -8807,10 +8846,7 @@ mod tests {
             "2026-08-31T00-00-00-000Z_newer.jsonl",
             newer_project.path(),
         );
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
-        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
-        env.remove("SENPI_CODING_AGENT_DIR");
+        let _env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(elsewhere.path());
 
         let result =
@@ -9190,10 +9226,7 @@ mod tests {
             "2026-08-31T00-00-00-000Z_global.jsonl",
             project_dir.path(),
         );
-        let mut env =
-            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
-        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
-        env.remove("SENPI_CODING_AGENT_DIR");
+        let _env = senpi_test_env_guard();
         let _current_dir = CurrentDirGuard::set(elsewhere.path());
 
         let result =
