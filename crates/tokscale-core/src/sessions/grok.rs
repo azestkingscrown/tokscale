@@ -324,7 +324,7 @@ fn extract_model_calls(usage: &Value) -> i64 {
         let sum: i64 = models
             .values()
             .map(|entry| usage_value(entry, &["modelCalls", "model_calls", "modelCallCount"]))
-            .sum();
+            .fold(0i64, |total, calls| total.saturating_add(calls));
         if sum > 0 {
             return sum;
         }
