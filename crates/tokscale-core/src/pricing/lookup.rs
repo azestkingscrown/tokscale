@@ -2195,8 +2195,7 @@ fn compute_xai_full_request_200k_cost(
     // When a usage record represents an aggregate of multiple requests (e.g.
     // a Grok Build turn with multiple model calls), evaluate whether an
     // individual request exceeded the threshold using average prompt per call.
-    let per_call_prompt = prompt_tokens / calls_i64;
-    if per_call_prompt >= TIERED_PRICING_THRESHOLD_200K_TOKENS as i64 {
+    if prompt_tokens >= (TIERED_PRICING_THRESHOLD_200K_TOKENS as i64).saturating_mul(calls_i64) {
         pricing.input_cost_per_token = pricing.input_cost_per_token_above_200k_tokens;
         pricing.output_cost_per_token = pricing.output_cost_per_token_above_200k_tokens;
         pricing.cache_read_input_token_cost = pricing.cache_read_input_token_cost_above_200k_tokens;

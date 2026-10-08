@@ -1576,6 +1576,11 @@ fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f6
     let Some(pricing) = pricing else {
         return 0.0;
     };
+    let calls = if msg.client == "droid" {
+        1
+    } else {
+        msg.message_count.max(1) as usize
+    };
     calculate_cost_with_service_tier_and_calls(
         pricing,
         &msg.model_id,
@@ -1589,7 +1594,7 @@ fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f6
             reasoning: msg.reasoning,
         },
         msg.service_tier.as_deref(),
-        (msg.message_count.max(1) as usize),
+        calls,
     )
 }
 
