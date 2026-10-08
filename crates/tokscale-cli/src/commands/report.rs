@@ -1589,7 +1589,7 @@ fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f6
             reasoning: msg.reasoning,
         },
         msg.service_tier.as_deref(),
-        (msg.message_count as usize).max(1),
+        (msg.message_count.max(1) as usize),
     )
 }
 
