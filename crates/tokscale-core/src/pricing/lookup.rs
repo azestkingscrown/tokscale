@@ -1889,13 +1889,23 @@ impl PricingLookup {
         provider_id: Option<&str>,
         usage: &TokenBreakdown,
     ) -> f64 {
+        self.calculate_cost_with_provider_and_calls(model_id, provider_id, usage, 1)
+    }
+
+    pub fn calculate_cost_with_provider_and_calls(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+        calls: usize,
+    ) -> f64 {
         let provider_id = normalize_provider_hint(provider_id);
         let result = match self.resolve_for_usage(model_id, provider_id, usage) {
             Some(r) => r,
             None => return 0.0,
         };
 
-        compute_cost_for_lookup(&result, provider_id, usage)
+        compute_cost_for_lookup_with_calls(&result, provider_id, usage, calls)
     }
 
     /// Resolve `model_id` for pricing `usage`, borrowing the rates the
@@ -2169,15 +2179,24 @@ fn uses_xai_full_request_200k_pricing(result: &LookupResult, provider_id: Option
     has_complete_200k_tier && !has_other_context_tier && !has_cache_write_pricing
 }
 
-fn compute_xai_full_request_200k_cost(result: &LookupResult, usage: &TokenBreakdown) -> f64 {
+fn compute_xai_full_request_200k_cost(
+    result: &LookupResult,
+    usage: &TokenBreakdown,
+    calls: usize,
+) -> f64 {
     let mut pricing = result.pricing.clone();
     let prompt_tokens = usage.input.max(0).saturating_add(usage.cache_read.max(0));
+    let calls_i64 = (calls as i64).max(1);
 
     // xAI's boundary is inclusive: a prompt that reaches 200k selects the
     // high rates for the entire request. Its public usage schema and current
     // LiteLLM rows publish no separate cache-write bucket, so an unpriced
     // cache-write value deliberately cannot flip every priced bucket.
-    if prompt_tokens >= TIERED_PRICING_THRESHOLD_200K_TOKENS as i64 {
+    // When a usage record represents an aggregate of multiple requests (e.g.
+    // a Grok Build turn with multiple model calls), evaluate whether an
+    // individual request exceeded the threshold using average prompt per call.
+    let per_call_prompt = prompt_tokens / calls_i64;
+    if per_call_prompt >= TIERED_PRICING_THRESHOLD_200K_TOKENS as i64 {
         pricing.input_cost_per_token = pricing.input_cost_per_token_above_200k_tokens;
         pricing.output_cost_per_token = pricing.output_cost_per_token_above_200k_tokens;
         pricing.cache_read_input_token_cost = pricing.cache_read_input_token_cost_above_200k_tokens;
@@ -2201,10 +2220,20 @@ fn compute_xai_full_request_200k_cost(result: &LookupResult, usage: &TokenBreakd
     )
 }
 
+#[cfg(test)]
 fn compute_cost_for_lookup(
     result: &LookupResult,
     provider_id: Option<&str>,
     usage: &TokenBreakdown,
+) -> f64 {
+    compute_cost_for_lookup_with_calls(result, provider_id, usage, 1)
+}
+
+fn compute_cost_for_lookup_with_calls(
+    result: &LookupResult,
+    provider_id: Option<&str>,
+    usage: &TokenBreakdown,
+    calls: usize,
 ) -> f64 {
     let calculate = |pricing| {
         compute_cost(
@@ -2218,7 +2247,7 @@ fn compute_cost_for_lookup(
         )
     };
     if uses_xai_full_request_200k_pricing(result, provider_id) {
-        return compute_xai_full_request_200k_cost(result, usage);
+        return compute_xai_full_request_200k_cost(result, usage, calls);
     }
 
     let total_input = usage
@@ -2226,12 +2255,14 @@ fn compute_cost_for_lookup(
         .max(0)
         .saturating_add(usage.cache_read.max(0))
         .saturating_add(usage.cache_write.max(0));
+    let calls_i64 = (calls as i64).max(1);
+    let per_call_input = total_input / calls_i64;
     if !uses_openai_full_request_272k_pricing(result, provider_id) {
         return calculate(&result.pricing);
     }
 
     let mut pricing = result.pricing.clone();
-    if total_input <= TIERED_PRICING_THRESHOLD_272K_TOKENS as i64 {
+    if per_call_input <= TIERED_PRICING_THRESHOLD_272K_TOKENS as i64 {
         pricing.input_cost_per_token_above_272k_tokens = None;
         pricing.output_cost_per_token_above_272k_tokens = None;
         pricing.cache_read_input_token_cost_above_272k_tokens = None;
@@ -7456,6 +7487,49 @@ mod tests {
         let cost = compute_cost_for_lookup(&result, Some("xai"), &usage);
         let expected = 149_999.0 * 0.000002 + 0.000006 + 50_000.0 * 0.0000005;
         assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn xai_200k_full_request_pricing_evaluates_average_prompt_for_multi_call_aggregate() {
+        let result = xai_200k_result("xai/grok-4.5", "LiteLLM");
+
+        // The issue #1387 reproduction case:
+        // 8 calls totaling 372,794 prompt tokens (average ~46.6k / call).
+        let turn_usage = TokenBreakdown {
+            input: 58_682,
+            output: 3_877,
+            cache_read: 314_112,
+            reasoning: 4_144,
+            ..Default::default()
+        };
+
+        // When calls == 1 (single request), prompt 372,794 >= 200k triggers doubled rates.
+        let single_call_cost =
+            compute_cost_for_lookup_with_calls(&result, Some("xai"), &turn_usage, 1);
+        let expected_high =
+            58_682.0 * 0.000004 + (3_877.0 + 4_144.0) * 0.000012 + 314_112.0 * 0.000001;
+        assert!((single_call_cost - expected_high).abs() < 1e-12);
+
+        // When calls == 8 (multi-call aggregate), average prompt is ~46.6k < 200k,
+        // so base rates apply across all buckets.
+        let multi_call_cost =
+            compute_cost_for_lookup_with_calls(&result, Some("xai"), &turn_usage, 8);
+        let expected_base =
+            58_682.0 * 0.000002 + (3_877.0 + 4_144.0) * 0.000006 + 314_112.0 * 0.0000005;
+        assert!((multi_call_cost - expected_base).abs() < 1e-12);
+        assert!((multi_call_cost - single_call_cost / 2.0).abs() < 1e-12);
+
+        // If average prompt per call DOES reach 200k (e.g. 2 calls of 250k each),
+        // the high tier applies.
+        let large_usage = TokenBreakdown {
+            input: 500_000,
+            output: 10_000,
+            ..Default::default()
+        };
+        let large_multi_call_cost =
+            compute_cost_for_lookup_with_calls(&result, Some("xai"), &large_usage, 2);
+        let expected_large = 500_000.0 * 0.000004 + 10_000.0 * 0.000012;
+        assert!((large_multi_call_cost - expected_large).abs() < 1e-12);
     }
 
     #[test]
