@@ -2256,7 +2256,7 @@ fn compute_cost_for_lookup_with_calls(
         .saturating_add(usage.cache_read.max(0))
         .saturating_add(usage.cache_write.max(0));
     let calls_i64 = (calls as i64).max(1);
-    let per_call_input = total_input / calls_i64;
+    let per_call_input = total_input / calls_i64 + i64::from(total_input % calls_i64 != 0);
     if !uses_openai_full_request_272k_pricing(result, provider_id) {
         return calculate(&result.pricing);
     }
