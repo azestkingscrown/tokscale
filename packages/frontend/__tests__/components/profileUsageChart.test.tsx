@@ -48,4 +48,23 @@ describe("ProfileUsageChart", () => {
       range.indexOf("Jan 3, 2026"),
     );
   });
+
+  it("renders display and provider select controls with provider options", () => {
+    const markup = renderToStaticMarkup(
+      <ProfileUsageChart
+        contributions={[
+          contribution("2026-01-01", 10),
+        ]}
+      />,
+    );
+
+    expect(markup).toContain('aria-label="Usage display"');
+    expect(markup).toContain('name="profile-usage-provider"');
+    expect(markup).toContain('aria-label="Usage provider"');
+    expect(markup).toContain('value="all"');
+    expect(markup).toContain('>All</option>');
+    expect(markup).toContain('value="claude"');
+    expect(markup).toContain('>Claude Code</option>');
+  });
 });
+
