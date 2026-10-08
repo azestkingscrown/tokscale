@@ -58,7 +58,7 @@ describe("ProfileUsageChart", () => {
       />,
     );
 
-    expect(markup).toContain('aria-label="Usage display"');
+    expect(markup).toMatch(/<select[^>]*aria-label="Usage display"[^>]*>[\s\S]*?<option value="average">[\s\S]*?<option value="daily">Daily<\/option>/);
     expect(markup).toContain('name="profile-usage-provider"');
     expect(markup).toContain('aria-label="Usage provider"');
     expect(markup).toContain('value="all"');
