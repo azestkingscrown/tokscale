@@ -806,6 +806,7 @@ pub fn built_in_extra_scan_paths_for(
         let user_state_dir = senpi_user_state_dir(home_dir);
         let omo_sessions = if use_env_roots {
             std::env::var_os("OMO_CODING_AGENT_DIR")
+                .filter(|dir| !dir.to_string_lossy().trim().is_empty())
                 .map(|dir| PathBuf::from(join_native(&dir.to_string_lossy(), "sessions")))
                 .unwrap_or_else(|| join_native_path(Path::new(home_dir), ".omo/agent/sessions"))
         } else {
