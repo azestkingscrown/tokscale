@@ -16,6 +16,7 @@ use tokio::sync::OnceCell;
 
 use crate::TokenBreakdown;
 
+pub use crate::EstimateSource;
 pub use litellm::ModelPricing;
 
 static PRICING_SERVICE: OnceCell<Arc<PricingService>> = OnceCell::const_new();
@@ -604,14 +605,33 @@ impl PricingService {
         self.calculate_cost_with_provider(model_id, None, &usage)
     }
 
-    pub fn calculate_cost_with_provider(
+    pub fn calculate_cost_detailed(
+        &self,
+        model_id: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+    ) -> (f64, Option<crate::EstimateSource>) {
+        let usage = TokenBreakdown {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            cache_write_1h: 0,
+            reasoning: 0,
+        };
+        self.calculate_cost_detailed_with_provider(model_id, None, &usage)
+    }
+
+    pub fn calculate_cost_detailed_with_provider(
         &self,
         model_id: &str,
         provider_id: Option<&str>,
         usage: &TokenBreakdown,
-    ) -> f64 {
+    ) -> (f64, Option<crate::EstimateSource>) {
         if let Some(result) = self.custom.lookup_with_key(model_id) {
-            return compute_cost(
+            let cost = compute_cost(
                 result.pricing,
                 usage.input,
                 usage.output,
@@ -620,10 +640,29 @@ impl PricingService {
                 usage.cache_write_1h,
                 usage.reasoning,
             );
+            if cost > 0.0 || (usage.total() > 0 && result.pricing.covers_usage(usage)) {
+                return (cost, Some(crate::EstimateSource::Custom));
+            }
         }
 
-        self.lookup
-            .calculate_cost_with_provider(model_id, provider_id, usage)
+        let cost = self
+            .lookup
+            .calculate_cost_with_provider(model_id, provider_id, usage);
+        if cost > 0.0 {
+            (cost, Some(crate::EstimateSource::Catalog))
+        } else {
+            (0.0, None)
+        }
+    }
+
+    pub fn calculate_cost_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> f64 {
+        self.calculate_cost_detailed_with_provider(model_id, provider_id, usage)
+            .0
     }
 
     pub fn covers_usage_with_provider(
@@ -726,6 +765,52 @@ mod tests {
             service.calculate_cost_with_provider("claude-fable-5-1", Some("anthropic"), &usage);
 
         assert!((cost - 3.25).abs() < 1e-9, "cost was {cost}");
+    }
+
+    #[test]
+    fn test_calculate_cost_detailed_distinguishes_sources() {
+        let mut custom = HashMap::new();
+        custom.insert("custom-model".to_string(), model_pricing(0.00001, 0.00002));
+        custom.insert("custom-free".to_string(), model_pricing(0.0, 0.0));
+
+        let mut litellm = HashMap::new();
+        litellm.insert("catalog-model".to_string(), model_pricing(0.00003, 0.00004));
+
+        let service = PricingService::new_with_custom(
+            CustomPricing::from_models(custom),
+            litellm,
+            HashMap::new(),
+        );
+
+        let usage = TokenBreakdown {
+            input: 1000,
+            output: 1000,
+            ..Default::default()
+        };
+
+        // Custom model returns EstimateSource::Custom
+        let (cost, source) =
+            service.calculate_cost_detailed_with_provider("custom-model", None, &usage);
+        assert!(cost > 0.0);
+        assert_eq!(source, Some(crate::EstimateSource::Custom));
+
+        // Custom free model covering usage returns EstimateSource::Custom with 0 cost
+        let (cost, source) =
+            service.calculate_cost_detailed_with_provider("custom-free", None, &usage);
+        assert_eq!(cost, 0.0);
+        assert_eq!(source, Some(crate::EstimateSource::Custom));
+
+        // Catalog model returns EstimateSource::Catalog
+        let (cost, source) =
+            service.calculate_cost_detailed_with_provider("catalog-model", None, &usage);
+        assert!(cost > 0.0);
+        assert_eq!(source, Some(crate::EstimateSource::Catalog));
+
+        // Unknown model returns None
+        let (cost, source) =
+            service.calculate_cost_detailed_with_provider("unknown-model", None, &usage);
+        assert_eq!(cost, 0.0);
+        assert_eq!(source, None);
     }
 
     fn custom_service(

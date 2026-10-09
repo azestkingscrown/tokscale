@@ -4788,6 +4788,8 @@ struct TsSourceContribution {
     tokens: TsTokenBreakdown,
     cost: f64,
     messages: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(serde::Serialize)]
@@ -4800,6 +4802,8 @@ struct TsDailyTotals {
     /// predate #1044. Only incomplete days pay a wire-format cost.
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_is_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(serde::Serialize)]
@@ -4827,6 +4831,8 @@ struct TsYearSummary {
     total_tokens: i64,
     total_cost: f64,
     range: DateRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(serde::Serialize)]
@@ -4840,6 +4846,8 @@ struct TsDataSummary {
     max_cost_in_single_day: f64,
     clients: Vec<String>,
     models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(serde::Serialize)]
@@ -4939,6 +4947,7 @@ fn to_ts_token_contribution_data(
             max_cost_in_single_day: graph.summary.max_cost_in_single_day,
             clients: graph.summary.clients.clone(),
             models: graph.summary.models.clone(),
+            cost_provenance: graph.summary.cost_provenance,
         },
         years: graph
             .years
@@ -4951,6 +4960,7 @@ fn to_ts_token_contribution_data(
                     start: y.range_start.clone(),
                     end: y.range_end.clone(),
                 },
+                cost_provenance: y.cost_provenance,
             })
             .collect(),
         contributions: graph
@@ -4966,6 +4976,7 @@ fn to_ts_token_contribution_data(
                         .incomplete_cost_dates
                         .contains(&d.date)
                         .then_some(false),
+                    cost_provenance: d.totals.cost_provenance,
                 },
                 intensity: d.intensity,
                 token_breakdown: TsTokenBreakdown {
@@ -4995,6 +5006,7 @@ fn to_ts_token_contribution_data(
                         },
                         cost: s.cost,
                         messages: s.messages,
+                        cost_provenance: s.cost_provenance,
                     })
                     .collect(),
                 active_time_ms: d.active_time_ms,
@@ -7649,6 +7661,7 @@ mod tests {
                 tokens: total_tokens,
                 cost: total_cost,
                 messages: 1,
+                cost_provenance: None,
             },
             intensity: 0,
             token_breakdown: token_breakdown(total_tokens),
@@ -7659,6 +7672,7 @@ mod tests {
                 tokens: token_breakdown(total_tokens),
                 cost: total_cost,
                 messages: 1,
+                cost_provenance: None,
             }],
             active_time_ms: None,
         }
@@ -9014,6 +9028,7 @@ mod tests {
             tokens: token_breakdown(total_tokens),
             cost,
             messages,
+            cost_provenance: None,
         }
     }
 
@@ -9031,6 +9046,7 @@ mod tests {
                 tokens,
                 cost,
                 messages,
+                cost_provenance: None,
             },
             intensity: 0,
             token_breakdown: token_breakdown(token_breakdown_total),
@@ -9188,6 +9204,74 @@ mod tests {
         assert!(json
             .pointer("/contributions/1/totals/costIsComplete")
             .is_none());
+    }
+
+    #[test]
+    fn submit_payload_serializes_cost_provenance_on_all_aggregates() {
+        let mut day1 = daily_contribution("2026-12-30", 100, 1.50, "claude", "claude-sonnet-4-5");
+        day1.totals.cost_provenance = Some(tokscale_core::CostProvenance::provider_reported());
+        day1.clients[0].cost_provenance = Some(tokscale_core::CostProvenance::provider_reported());
+
+        let mut day2 = daily_contribution("2026-12-31", 200, 2.00, "codex", "gpt-5");
+        day2.totals.cost_provenance = Some(tokscale_core::CostProvenance::estimated(
+            tokscale_core::EstimateSource::Catalog,
+        ));
+        day2.clients[0].cost_provenance = Some(tokscale_core::CostProvenance::estimated(
+            tokscale_core::EstimateSource::Catalog,
+        ));
+
+        let mut graph = graph_result_with_contributions(vec![day1, day2]);
+        graph.summary.cost_provenance = Some(tokscale_core::CostProvenance::mixed(None));
+        graph.years[0].cost_provenance = Some(tokscale_core::CostProvenance::mixed(None));
+
+        let payload = to_ts_token_contribution_data(&graph, None, None);
+        let json = serde_json::to_value(&payload).unwrap();
+
+        // summary
+        assert_eq!(
+            json.pointer("/summary/costProvenance"),
+            Some(&serde_json::json!({ "kind": "mixed" }))
+        );
+
+        // years
+        assert_eq!(
+            json.pointer("/years/0/costProvenance"),
+            Some(&serde_json::json!({ "kind": "mixed" }))
+        );
+
+        // contributions[0].totals and clients[0]
+        assert_eq!(
+            json.pointer("/contributions/0/totals/costProvenance"),
+            Some(&serde_json::json!({ "kind": "providerReported" }))
+        );
+        assert_eq!(
+            json.pointer("/contributions/0/clients/0/costProvenance"),
+            Some(&serde_json::json!({ "kind": "providerReported" }))
+        );
+
+        // contributions[1].totals and clients[0]
+        assert_eq!(
+            json.pointer("/contributions/1/totals/costProvenance"),
+            Some(&serde_json::json!({ "kind": "estimated", "estimateSource": "catalog" }))
+        );
+        assert_eq!(
+            json.pointer("/contributions/1/clients/0/costProvenance"),
+            Some(&serde_json::json!({ "kind": "estimated", "estimateSource": "catalog" }))
+        );
+
+        // existing fields preserved
+        assert_eq!(
+            json.pointer("/summary/totalCost"),
+            Some(&serde_json::json!(3.5))
+        );
+        assert_eq!(
+            json.pointer("/contributions/0/totals/cost"),
+            Some(&serde_json::json!(1.5))
+        );
+        assert_eq!(
+            json.pointer("/contributions/0/clients/0/cost"),
+            Some(&serde_json::json!(1.5))
+        );
     }
 
     #[test]
