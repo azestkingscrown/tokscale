@@ -862,6 +862,17 @@ describe("POST /api/submit Antigravity family high-water", () => {
     const json = await replay.json();
     expect(json.metrics.totalTokens).toBe(320_000);
     expect(storedTokens(store)).toBe(320_000);
+    expect(store.days.map((d) => d.date).sort()).toEqual(["2026-08-07", "2026-09-01"]);
+    expect(
+      store.days.find((d) => d.date === "2026-08-07")?.sourceBreakdown[
+        "antigravity-cli"
+      ].tokens,
+    ).toBe(240_000);
+    expect(
+      store.days.find((d) => d.date === "2026-09-01")?.sourceBreakdown[
+        "antigravity-cli"
+      ].tokens,
+    ).toBe(80_000);
   });
 
   it("prevents re-attribution inflation within the historical credited window", async () => {

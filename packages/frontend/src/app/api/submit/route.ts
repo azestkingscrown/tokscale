@@ -1551,7 +1551,10 @@ export async function POST(request: Request) {
         submissionId,
         isNewSubmission,
         metrics: {
-          totalTokens: Number(aggregates.totalTokens),
+          totalTokens:
+            aggregates.totalTokens >= 9007199254740991
+              ? 9007199254740991
+              : Number(aggregates.totalTokens),
           totalCost: parseFloat(aggregates.totalCost),
           dateRange: {
             start: effectiveDateStart,
