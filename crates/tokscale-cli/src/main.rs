@@ -485,7 +485,8 @@ enum CursorSubcommand {
         #[arg(
             long,
             value_name = "SECONDS",
-            help = "Overall sync timeout in seconds (overrides default 120s budget)"
+            value_parser = clap::value_parser!(u64).range(1..),
+            help = "Overall sync timeout in seconds (overrides default dynamic budget)"
         )]
         timeout: Option<u64>,
     },
@@ -9617,6 +9618,7 @@ mod tests {
         assert!(Cli::try_parse_from(["tokscale", "cursor", "sync"]).is_ok());
         assert!(Cli::try_parse_from(["tokscale", "cursor", "sync", "--json"]).is_ok());
         assert!(Cli::try_parse_from(["tokscale", "cursor", "sync", "--timeout", "300"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "cursor", "sync", "--timeout", "0"]).is_err());
     }
 
     #[test]

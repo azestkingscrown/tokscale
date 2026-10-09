@@ -2031,8 +2031,45 @@ pub fn run_cursor_switch(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::collections::HashMap;
     use tempfile::TempDir;
+
+    struct EnvVarGuard {
+        name: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(name);
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            Self { name, original }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let original = std::env::var_os(name);
+            unsafe {
+                std::env::remove_var(name);
+            }
+            Self { name, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe {
+                    std::env::set_var(self.name, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.name);
+                },
+            }
+        }
+    }
 
     /// #1250: cursor.com serves a bot-protection challenge instead of the API
     /// response when the ClientHello comes from rustls, so this one client has
@@ -2232,7 +2269,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_sync_timeout_override_only_for_explicit_sync() {
+        let _g1 = EnvVarGuard::remove(CURSOR_SYNC_TIMEOUT_MS_ENV);
+        let _g2 = EnvVarGuard::remove(CURSOR_SYNC_TIMEOUT_SECS_ENV);
         assert_eq!(
             sync_timeout_override(true, None),
             (Some(Duration::from_secs(120)), false)
@@ -2249,22 +2289,27 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_sync_timeout_override_honors_env_vars() {
-        std::env::set_var(CURSOR_SYNC_TIMEOUT_MS_ENV, "180000");
-        assert_eq!(
-            sync_timeout_override(true, None),
-            (Some(Duration::from_millis(180000)), true)
-        );
-        assert_eq!(sync_timeout_override(false, None), (None, false));
-        std::env::remove_var(CURSOR_SYNC_TIMEOUT_MS_ENV);
+        {
+            let _g_clean = EnvVarGuard::remove(CURSOR_SYNC_TIMEOUT_SECS_ENV);
+            let _g_ms = EnvVarGuard::set(CURSOR_SYNC_TIMEOUT_MS_ENV, "180000");
+            assert_eq!(
+                sync_timeout_override(true, None),
+                (Some(Duration::from_millis(180000)), true)
+            );
+            assert_eq!(sync_timeout_override(false, None), (None, false));
+        }
 
-        std::env::set_var(CURSOR_SYNC_TIMEOUT_SECS_ENV, "240");
-        assert_eq!(
-            sync_timeout_override(true, None),
-            (Some(Duration::from_secs(240)), true)
-        );
-        assert_eq!(sync_timeout_override(false, None), (None, false));
-        std::env::remove_var(CURSOR_SYNC_TIMEOUT_SECS_ENV);
+        {
+            let _g_clean = EnvVarGuard::remove(CURSOR_SYNC_TIMEOUT_MS_ENV);
+            let _g_secs = EnvVarGuard::set(CURSOR_SYNC_TIMEOUT_SECS_ENV, "240");
+            assert_eq!(
+                sync_timeout_override(true, None),
+                (Some(Duration::from_secs(240)), true)
+            );
+            assert_eq!(sync_timeout_override(false, None), (None, false));
+        }
     }
 
     #[test]
