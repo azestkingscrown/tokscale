@@ -651,24 +651,8 @@ impl PricingService {
             return (cost, covered.then_some(crate::EstimateSource::Custom));
         }
 
-        let cost = self
-            .lookup
-            .calculate_cost_with_provider(model_id, provider_id, usage);
-        if cost > 0.0 {
-            return (cost, Some(crate::EstimateSource::Catalog));
-        }
-
-        // A catalog row can legitimately price usage at zero (free or
-        // subscription models). Mirror the custom branch: a zero the row
-        // covers is an estimate, not an unknown.
-        let covered_zero = usage.total() > 0
-            && self
-                .lookup
-                .resolve_for_usage(model_id, provider_id, usage)
-                .is_some_and(|result| {
-                    result.evidence.is_submission_safe() && result.pricing.covers_usage(usage)
-                });
-        (0.0, covered_zero.then_some(crate::EstimateSource::Catalog))
+        self.lookup
+            .calculate_cost_detailed_with_provider(model_id, provider_id, usage)
     }
 
     pub fn calculate_cost_with_provider(
