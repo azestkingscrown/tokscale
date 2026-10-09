@@ -1182,23 +1182,7 @@ pub async fn validate_cursor_session(token: &str) -> ValidateSessionResult {
     }
 }
 
-#[allow(dead_code)]
-pub async fn fetch_cursor_usage_events_json(
-    session_token: &str,
-    timeout_override: Option<Duration>,
-) -> Result<String> {
-    fetch_cursor_usage_events_json_from(
-        USAGE_EVENTS_JSON_ENDPOINT,
-        session_token,
-        timeout_override,
-        timeout_override.is_some(),
-        CURSOR_MAX_JSON_BYTES,
-        CURSOR_JSON_PAGE_SIZE,
-    )
-    .await
-}
-
-/// Body of [`fetch_cursor_usage_events_json`] with the endpoint, byte ceiling,
+/// Fetch Cursor usage events JSON with the endpoint, byte ceiling,
 /// and page size injected so tests can drive the real paginating path against a
 /// local server.
 ///
