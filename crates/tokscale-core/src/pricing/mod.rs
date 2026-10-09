@@ -612,6 +612,7 @@ impl PricingService {
         output: i64,
         cache_read: i64,
         cache_write: i64,
+        reasoning: i64,
     ) -> (f64, Option<crate::EstimateSource>) {
         let usage = TokenBreakdown {
             input,
@@ -619,11 +620,17 @@ impl PricingService {
             cache_read,
             cache_write,
             cache_write_1h: 0,
-            reasoning: 0,
+            reasoning,
         };
         self.calculate_cost_detailed_with_provider(model_id, None, &usage)
     }
 
+    /// Price `usage` and report which pricing source produced the figure.
+    ///
+    /// The cost is identical to what `calculate_cost_with_provider` has always
+    /// returned: a custom match wins outright, even when it prices the usage at
+    /// zero. The source is `None` when no rate covers the usage, so a zero that
+    /// means "unpriced" is never reported as an estimate.
     pub fn calculate_cost_detailed_with_provider(
         &self,
         model_id: &str,
@@ -640,19 +647,28 @@ impl PricingService {
                 usage.cache_write_1h,
                 usage.reasoning,
             );
-            if cost > 0.0 || (usage.total() > 0 && result.pricing.covers_usage(usage)) {
-                return (cost, Some(crate::EstimateSource::Custom));
-            }
+            let covered = cost > 0.0 || (usage.total() > 0 && result.pricing.covers_usage(usage));
+            return (cost, covered.then_some(crate::EstimateSource::Custom));
         }
 
         let cost = self
             .lookup
             .calculate_cost_with_provider(model_id, provider_id, usage);
         if cost > 0.0 {
-            (cost, Some(crate::EstimateSource::Catalog))
-        } else {
-            (0.0, None)
+            return (cost, Some(crate::EstimateSource::Catalog));
         }
+
+        // A catalog row can legitimately price usage at zero (free or
+        // subscription models). Mirror the custom branch: a zero the row
+        // covers is an estimate, not an unknown.
+        let covered_zero = usage.total() > 0
+            && self
+                .lookup
+                .resolve_for_usage(model_id, provider_id, usage)
+                .is_some_and(|result| {
+                    result.evidence.is_submission_safe() && result.pricing.covers_usage(usage)
+                });
+        (0.0, covered_zero.then_some(crate::EstimateSource::Catalog))
     }
 
     pub fn calculate_cost_with_provider(
@@ -811,6 +827,62 @@ mod tests {
             service.calculate_cost_detailed_with_provider("unknown-model", None, &usage);
         assert_eq!(cost, 0.0);
         assert_eq!(source, None);
+    }
+
+    #[test]
+    fn detailed_cost_keeps_partial_custom_row_at_zero_instead_of_falling_to_catalog() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "shared-model".to_string(),
+            ModelPricing {
+                output_cost_per_token: Some(0.00002),
+                ..Default::default()
+            },
+        );
+        let mut litellm = HashMap::new();
+        litellm.insert("shared-model".to_string(), model_pricing(0.00003, 0.00004));
+        let service = custom_service(custom, litellm, HashMap::new());
+
+        let input_only = TokenBreakdown {
+            input: 1000,
+            ..Default::default()
+        };
+        let (cost, source) =
+            service.calculate_cost_detailed_with_provider("shared-model", None, &input_only);
+        assert_eq!(cost, 0.0);
+        assert_eq!(source, None);
+        assert_eq!(
+            service.calculate_cost_with_provider("shared-model", None, &input_only),
+            0.0
+        );
+    }
+
+    #[test]
+    fn detailed_cost_prices_reasoning_tokens() {
+        let mut custom = HashMap::new();
+        custom.insert("reasoner".to_string(), model_pricing(0.0, 0.00002));
+        let service = custom_service(custom, HashMap::new(), HashMap::new());
+
+        let (cost, source) = service.calculate_cost_detailed("reasoner", 0, 0, 0, 0, 1000);
+        assert!(cost > 0.0);
+        assert_eq!(source, Some(crate::EstimateSource::Custom));
+    }
+
+    #[test]
+    fn detailed_cost_reports_catalog_for_covered_zero_rate_rows() {
+        let mut litellm = HashMap::new();
+        litellm.insert("free-model".to_string(), model_pricing(0.0, 0.0));
+        let service = PricingService::new(litellm, HashMap::new());
+        let usage = TokenBreakdown {
+            input: 1000,
+            output: 1000,
+            ..Default::default()
+        };
+
+        let (cost, source) =
+            service.calculate_cost_detailed_with_provider("free-model", None, &usage);
+        assert_eq!(cost, 0.0);
+        assert_eq!(source, Some(crate::EstimateSource::Catalog));
     }
 
     fn custom_service(

@@ -5406,8 +5406,13 @@ fn apply_pricing_if_available(
     let calculated_cost = calculated_cost * pricing_multiplier(message, pricing);
 
     if let Some(source) = estimate_source {
-        message.cost = calculated_cost;
-        message.mark_estimated_cost_with_source(source);
+        // A covered zero rate may classify a message that carries no cost, but
+        // must never zero out a positive cost already on a non-authoritative
+        // message (e.g. after a cross-file merge).
+        if calculated_cost > 0.0 || message.cost <= 0.0 {
+            message.cost = calculated_cost;
+            message.mark_estimated_cost_with_source(source);
+        }
     }
 }
 

@@ -6145,6 +6145,14 @@ fn exclude_tokenless_cost_contributions(
         if removed_cost > 0.0 || removed_messages > 0 {
             day.totals.cost = (day.totals.cost - removed_cost).max(0.0);
             day.totals.messages = day.totals.messages.saturating_sub(removed_messages).max(0);
+
+            // The day's provenance folded in the rows just dropped, so rebuild
+            // it from the clients that remain.
+            let mut provenance = tokscale_core::CostProvenanceAccumulator::default();
+            for client in &day.clients {
+                provenance.add_provenance(&client.cost_provenance());
+            }
+            day.totals.cost_provenance = Some(provenance.finish());
         }
     }
 
@@ -9090,6 +9098,31 @@ mod tests {
         assert_eq!(day.totals.messages, 45);
         assert!((graph.summary.total_cost - 2.08).abs() < 1e-9);
         assert_eq!(graph.summary.total_tokens, 100);
+    }
+
+    #[test]
+    fn test_exclude_tokenless_cost_rebuilds_day_provenance_from_retained_rows() {
+        let mut kept =
+            client_contribution("cursor", "claude-3.7-sonnet", "anthropic", 100, 0.03, 1);
+        kept.cost_provenance = Some(tokscale_core::CostProvenance::provider_reported());
+        let mut dropped = client_contribution("cursor", "auto", "cursor", 0, 0.04, 1);
+        dropped.cost_provenance = Some(tokscale_core::CostProvenance::estimated(
+            tokscale_core::EstimateSource::Catalog,
+        ));
+        let mut day = day_with_clients("2025-05-28", 100, vec![kept, dropped]);
+        day.totals.cost_provenance = Some(tokscale_core::CostProvenance::mixed(None));
+        let mut graph = graph_result_with_contributions(vec![day]);
+
+        exclude_tokenless_cost_contributions(&mut graph);
+
+        assert_eq!(
+            graph.contributions[0].totals.cost_provenance,
+            Some(tokscale_core::CostProvenance::provider_reported())
+        );
+        assert_eq!(
+            graph.summary.cost_provenance(),
+            tokscale_core::CostProvenance::provider_reported()
+        );
     }
 
     #[test]
