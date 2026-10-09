@@ -34,6 +34,30 @@ const CURSOR_DYNAMIC_BUDGET_SECS_PER_PAGE: u64 = 3;
 /// Maximum duration dynamic scaling may expand the explicit sync budget to.
 const CURSOR_MAX_DYNAMIC_SYNC_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// Compute the dynamic sync timeout budget for a Cursor usage events walk.
+///
+/// Accounts with tens of thousands of rows require multiple paginated requests.
+/// When no explicit custom timeout is given, Tokscale dynamically scales the budget
+/// based on the advertised total count and the observed page yield, allocating
+/// 3 seconds per estimated page (clamped between the initial budget and 1,800s).
+pub fn compute_dynamic_cursor_budget(
+    total_events: u64,
+    effective_page_size: usize,
+    initial_budget: Duration,
+) -> Duration {
+    if effective_page_size == 0 {
+        return initial_budget;
+    }
+    let total_pages = (total_events.saturating_add(effective_page_size as u64 - 1))
+        / (effective_page_size as u64);
+    let estimated_needed = Duration::from_secs(
+        total_pages.saturating_mul(CURSOR_DYNAMIC_BUDGET_SECS_PER_PAGE),
+    );
+    estimated_needed
+        .max(initial_budget)
+        .min(CURSOR_MAX_DYNAMIC_SYNC_TIMEOUT)
+}
+
 /// Skip implicit pre-report sync when every expected Cursor account cache file
 /// was modified within this window. Prevents `tokscale models` (and its
 /// siblings) from issuing a Cursor API call on every invocation. The manual
@@ -1252,7 +1276,7 @@ async fn fetch_cursor_usage_events_json_from(
             Ok(resp) => resp,
             Err(err) => {
                 let now = Instant::now();
-                if err.is_timeout() || fetch_deadline.saturating_duration_since(now).is_zero() {
+                if fetch_deadline.saturating_duration_since(now).is_zero() {
                     let budget_secs = overall_budget.as_secs();
                     let fetched_pages = page - 1;
                     let pages_str = if fetched_pages == 1 { "page" } else { "pages" };
@@ -1303,9 +1327,17 @@ async fn fetch_cursor_usage_events_json_from(
                     let budget_secs = overall_budget.as_secs();
                     let fetched_pages = page - 1;
                     let pages_str = if fetched_pages == 1 { "page" } else { "pages" };
-                    anyhow::bail!(
-                        "Cursor usage events fetch exceeded its {budget_secs}s time budget while reading page {page} ({fetched_pages} {pages_str} collected before timeout): {err}"
-                    );
+                    if let Some(total) = total_count {
+                        anyhow::bail!(
+                            "Cursor usage events fetch exceeded its {budget_secs}s time budget while reading page {page} ({fetched_pages} {pages_str}, {}/{total} events collected before timeout): {err}",
+                            all_events.len()
+                        );
+                    } else {
+                        anyhow::bail!(
+                            "Cursor usage events fetch exceeded its {budget_secs}s time budget while reading page {page} ({fetched_pages} {pages_str}, {} events collected before timeout): {err}",
+                            all_events.len()
+                        );
+                    }
                 }
                 return Err(err);
             }
@@ -1321,22 +1353,6 @@ async fn fetch_cursor_usage_events_json_from(
                 .and_then(|value| value.as_u64())
             {
                 total_count = Some(total);
-                // When running an explicit sync with the default budget (no custom
-                // override specified via flag or environment variable), dynamically
-                // scale the wall-clock budget with the advertised total events so
-                // accounts with tens of thousands of rows don't abort prematurely.
-                if !is_custom_timeout && timeout_override.is_some() && page_size > 0 {
-                    let total_pages =
-                        (total.saturating_add(page_size as u64 - 1)) / (page_size as u64);
-                    let estimated_needed = Duration::from_secs(
-                        total_pages.saturating_mul(CURSOR_DYNAMIC_BUDGET_SECS_PER_PAGE),
-                    );
-                    if estimated_needed > overall_budget {
-                        let expanded = estimated_needed.min(CURSOR_MAX_DYNAMIC_SYNC_TIMEOUT);
-                        fetch_deadline = start_time + expanded;
-                        overall_budget = expanded;
-                    }
-                }
             }
         }
 
@@ -1355,6 +1371,24 @@ async fn fetch_cursor_usage_events_json_from(
         };
         let received = page_events.len();
         all_events.extend(page_events);
+
+        // When running an explicit sync with the default budget (no custom
+        // override specified via flag or environment variable), dynamically
+        // scale the wall-clock budget with the advertised total events so
+        // accounts with tens of thousands of rows don't abort prematurely.
+        // Base the page estimate on observed page yield so server-side page
+        // clamping (e.g. Cursor clamping a 500-event request to 100) doesn't
+        // underestimate pages and time out.
+        if !is_custom_timeout && timeout_override.is_some() {
+            if let Some(total) = total_count {
+                let effective_page = if received > 0 { received } else { page_size };
+                let expanded = compute_dynamic_cursor_budget(total, effective_page, initial_budget);
+                if expanded > overall_budget {
+                    fetch_deadline = start_time + expanded;
+                    overall_budget = expanded;
+                }
+            }
+        }
 
         // Once the advertised total is known, keep paging until it is reached so
         // a server that clamps `pageSize` (a short page while more events remain)
@@ -2701,6 +2735,31 @@ mod tests {
             msg.contains("time budget"),
             "error must report budget exhaustion: {msg}"
         );
+    }
+
+    #[test]
+    fn test_compute_dynamic_cursor_budget_scaling() {
+        let default_budget = Duration::from_secs(120);
+
+        // Zero page size returns initial budget
+        assert_eq!(compute_dynamic_cursor_budget(10_000, 0, default_budget), default_budget);
+
+        // Small count inside default budget remains initial budget
+        assert_eq!(compute_dynamic_cursor_budget(500, 500, default_budget), default_budget);
+        assert_eq!(compute_dynamic_cursor_budget(40 * 500, 500, default_budget), default_budget); // 40 pages * 3s = 120s
+
+        // 40,000 events with 500 page size = 80 pages * 3s = 240s
+        assert_eq!(compute_dynamic_cursor_budget(40_000, 500, default_budget), Duration::from_secs(240));
+
+        // 40,000 events with 100 clamped page size = 400 pages * 3s = 1200s
+        assert_eq!(compute_dynamic_cursor_budget(40_000, 100, default_budget), Duration::from_secs(1200));
+
+        // Extremely large count caps at 1800s (30m)
+        assert_eq!(compute_dynamic_cursor_budget(1_000_000, 100, default_budget), Duration::from_secs(1800));
+
+        // Custom higher initial budget is preserved if needed is smaller
+        let high_budget = Duration::from_secs(300);
+        assert_eq!(compute_dynamic_cursor_budget(40_000, 500, high_budget), high_budget);
     }
 
     #[test]
