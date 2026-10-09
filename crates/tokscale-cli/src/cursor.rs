@@ -50,9 +50,8 @@ pub fn compute_dynamic_cursor_budget(
     }
     let total_pages = (total_events.saturating_add(effective_page_size as u64 - 1))
         / (effective_page_size as u64);
-    let estimated_needed = Duration::from_secs(
-        total_pages.saturating_mul(CURSOR_DYNAMIC_BUDGET_SECS_PER_PAGE),
-    );
+    let estimated_needed =
+        Duration::from_secs(total_pages.saturating_mul(CURSOR_DYNAMIC_BUDGET_SECS_PER_PAGE));
     estimated_needed
         .max(initial_budget)
         .min(CURSOR_MAX_DYNAMIC_SYNC_TIMEOUT)
@@ -2742,24 +2741,45 @@ mod tests {
         let default_budget = Duration::from_secs(120);
 
         // Zero page size returns initial budget
-        assert_eq!(compute_dynamic_cursor_budget(10_000, 0, default_budget), default_budget);
+        assert_eq!(
+            compute_dynamic_cursor_budget(10_000, 0, default_budget),
+            default_budget
+        );
 
         // Small count inside default budget remains initial budget
-        assert_eq!(compute_dynamic_cursor_budget(500, 500, default_budget), default_budget);
-        assert_eq!(compute_dynamic_cursor_budget(40 * 500, 500, default_budget), default_budget); // 40 pages * 3s = 120s
+        assert_eq!(
+            compute_dynamic_cursor_budget(500, 500, default_budget),
+            default_budget
+        );
+        assert_eq!(
+            compute_dynamic_cursor_budget(40 * 500, 500, default_budget),
+            default_budget
+        ); // 40 pages * 3s = 120s
 
         // 40,000 events with 500 page size = 80 pages * 3s = 240s
-        assert_eq!(compute_dynamic_cursor_budget(40_000, 500, default_budget), Duration::from_secs(240));
+        assert_eq!(
+            compute_dynamic_cursor_budget(40_000, 500, default_budget),
+            Duration::from_secs(240)
+        );
 
         // 40,000 events with 100 clamped page size = 400 pages * 3s = 1200s
-        assert_eq!(compute_dynamic_cursor_budget(40_000, 100, default_budget), Duration::from_secs(1200));
+        assert_eq!(
+            compute_dynamic_cursor_budget(40_000, 100, default_budget),
+            Duration::from_secs(1200)
+        );
 
         // Extremely large count caps at 1800s (30m)
-        assert_eq!(compute_dynamic_cursor_budget(1_000_000, 100, default_budget), Duration::from_secs(1800));
+        assert_eq!(
+            compute_dynamic_cursor_budget(1_000_000, 100, default_budget),
+            Duration::from_secs(1800)
+        );
 
         // Custom higher initial budget is preserved if needed is smaller
         let high_budget = Duration::from_secs(300);
-        assert_eq!(compute_dynamic_cursor_budget(40_000, 500, high_budget), high_budget);
+        assert_eq!(
+            compute_dynamic_cursor_budget(40_000, 500, high_budget),
+            high_budget
+        );
     }
 
     #[test]
