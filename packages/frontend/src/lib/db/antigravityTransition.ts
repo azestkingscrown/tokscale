@@ -36,9 +36,10 @@ const COVERAGE_FIELDS = [
 ] as const;
 
 export interface AntigravityTransitionPlan {
-  mode: "status-quo" | "freeze" | "replace";
+  mode: "status-quo" | "freeze" | "replace" | "incremental";
   parserVersions?: Record<string, number>;
   layouts?: FamilyLayouts;
+  increments?: Record<AntigravityClient, Record<string, ClientBreakdownData>>;
   warning?: string;
 }
 
@@ -174,12 +175,84 @@ export function planAntigravityTransition(args: {
   const incoming = familyCoverage(
     ANTIGRAVITY_FAMILY.flatMap((client) => Object.values(layouts[client]))
   );
-  if (
+  const hasCoverageDeficit =
     !covers(previous.total, incoming.total) ||
     [...previous.models].some(([modelId, coverage]) =>
       !covers(coverage, incoming.models.get(modelId))
-    )
-  ) {
+    );
+
+  if (hasCoverageDeficit) {
+    const hasLegacyUnmigratedState = ANTIGRAVITY_FAMILY.some(
+      (client) => ownValue(args.parserStates, client) !== undefined
+    );
+
+    if (!hasLegacyUnmigratedState) {
+      const existingFamilyDates = new Set(
+        args.existingDays
+          .filter((day) => {
+            const breakdown = (day.sourceBreakdown ?? {}) as Record<
+              string,
+              ClientBreakdownData
+            >;
+            return ANTIGRAVITY_FAMILY.some(
+              (client) => ownValue(breakdown, client) !== undefined
+            );
+          })
+          .map((day) => day.date)
+      );
+
+      const lastCreditedDate =
+        existingFamilyDates.size > 0
+          ? [...existingFamilyDates].reduce((max, d) => (d > max ? d : max))
+          : undefined;
+
+      const incomingFamilyDates = new Set<string>();
+      for (const client of ANTIGRAVITY_FAMILY) {
+        for (const date of Object.keys(layouts[client])) {
+          incomingFamilyDates.add(date);
+        }
+      }
+
+      // Server-verifiable continuity:
+      // The incoming snapshot must retain overlapping dates with credited history
+      // (proving historical continuity rather than an unverified disjoint jump),
+      // and must have activity extending strictly beyond the last credited date.
+      const hasHistoricalOverlap = [...incomingFamilyDates].some((date) =>
+        existingFamilyDates.has(date)
+      );
+
+      const newDates = new Set<string>();
+      if (lastCreditedDate && hasHistoricalOverlap) {
+        for (const date of incomingFamilyDates) {
+          if (date > lastCreditedDate) {
+            newDates.add(date);
+          }
+        }
+      }
+
+      if (newDates.size > 0 && lastCreditedDate) {
+        const increments = Object.fromEntries(
+          ANTIGRAVITY_FAMILY.map((client) => [
+            client,
+            Object.fromEntries(
+              Object.entries(layouts[client]).filter(([date]) => newDates.has(date))
+            ),
+          ])
+        ) as Record<AntigravityClient, Record<string, ClientBreakdownData>>;
+
+        const tokenDeficit = Math.max(0, previous.total.tokens - incoming.total.tokens);
+        const deficitMsg = tokenDeficit > 0 ? ` (${tokenDeficit.toLocaleString()} token shortfall)` : "";
+
+        return {
+          mode: "incremental",
+          parserVersions,
+          increments,
+          layouts,
+          warning: `Preserved Antigravity sources prior to ${lastCreditedDate}${deficitMsg} because older local history was pruned under the credited high-water. Genuinely new activity after ${lastCreditedDate} was credited.`,
+        };
+      }
+    }
+
     return freeze("the full snapshot does not cover this device's credited Antigravity family usage");
   }
 
