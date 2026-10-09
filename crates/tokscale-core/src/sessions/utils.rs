@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::SystemTime;
@@ -541,14 +541,44 @@ pub(crate) fn estimate_tokens(chars: usize) -> i64 {
     chars.div_ceil(4) as i64
 }
 
+/// Bounded limit for decompressing archived transcripts (.zst) into memory.
+pub(crate) const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// True when a path has a `.zst` file extension.
+pub(crate) fn is_zst_path(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zst"))
+}
+
+/// Read a zstd-compressed archive file with a bounded decompressed byte limit.
+pub(crate) fn read_archive(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut decoder = zstd::stream::read::Decoder::new(file)?;
+    decoder.window_log_max(26)?;
+    let mut bytes = Vec::new();
+    decoder.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::other(
+            "decoded transcript exceeds archive limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Session id taken from a transcript file's stem, e.g.
 /// `.../ses_abc123.jsonl` -> `ses_abc123`.
+/// If the file is compressed (`.jsonl.zst`), the outer `.zst` is stripped first
+/// so the logical stem matches the uncompressed session name.
 ///
 /// Clients whose session id is not the file stem — or that treat a blank stem
 /// differently — keep their own resolver rather than calling this.
 pub(crate) fn session_id_from_path(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
+    let mut stem = path.file_stem();
+    if is_zst_path(path) {
+        if let Some(s) = stem {
+            stem = Path::new(s).file_stem();
+        }
+    }
+    stem.and_then(|stem| stem.to_str())
         .unwrap_or("unknown")
         .to_string()
 }
