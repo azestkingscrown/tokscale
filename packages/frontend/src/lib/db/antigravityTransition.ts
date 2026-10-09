@@ -214,15 +214,22 @@ export function planAntigravityTransition(args: {
       }
 
       // Server-verifiable continuity:
-      // The incoming snapshot must retain overlapping dates with credited history
-      // (proving historical continuity rather than an unverified disjoint jump),
-      // and must have activity extending strictly beyond the last credited date.
-      const hasHistoricalOverlap = [...incomingFamilyDates].some((date) =>
-        existingFamilyDates.has(date)
-      );
+      // 1. The device must already have completed parser generation migration (persistedVersions >= 1),
+      //    guaranteeing that per-turn event dating is already established and no generations can be re-dated
+      //    from older dates to newer dates across versions.
+      // 2. The incoming snapshot must anchor directly on lastCreditedDate (the boundary of credited history),
+      //    proving unbroken historical continuity rather than an unverified disjoint jump.
+      // 3. Activity extends strictly beyond lastCreditedDate into genuinely new dates.
+      const isAlreadyMigrated = ANTIGRAVITY_FAMILY.every((client) => {
+        const persisted = ownValue(args.persistedVersions ?? {}, client);
+        return persisted !== undefined && persisted >= 1;
+      });
+
+      const anchorsOnLastCreditedDate =
+        lastCreditedDate !== undefined && incomingFamilyDates.has(lastCreditedDate);
 
       const newDates = new Set<string>();
-      if (lastCreditedDate && hasHistoricalOverlap) {
+      if (lastCreditedDate && anchorsOnLastCreditedDate && isAlreadyMigrated) {
         for (const date of incomingFamilyDates) {
           if (date > lastCreditedDate) {
             newDates.add(date);

@@ -904,6 +904,35 @@ describe("POST /api/submit Antigravity family high-water", () => {
     expect(store.days.map((d) => d.date).sort()).toEqual(["2026-08-05", "2026-08-07"]);
   });
 
+  it("freezes when a deficit snapshot introduces new dates without anchoring on lastCreditedDate", async () => {
+    const store = newStore();
+    installTx(store);
+    const first = submissionBody("antigravity-cli", [
+      { date: "2026-08-05", tokens: 100_000, messages: 5 },
+      { date: "2026-08-07", tokens: 140_000, messages: 7 },
+    ]);
+    mockSubmit(first);
+    expect((await post(first)).status).toBe(200);
+    expect(storedTokens(store)).toBe(240_000);
+
+    // Deficit snapshot that contains 08-05 and 09-01, but misses lastCreditedDate (08-07).
+    // Because it fails to anchor on lastCreditedDate, it cannot prove continuity against
+    // the credited boundary and must freeze.
+    installTx(store);
+    const unanchored = submissionBody("antigravity-cli", [
+      { date: "2026-08-05", tokens: 80_000, messages: 4 },
+      { date: "2026-09-01", tokens: 50_000, messages: 2 },
+    ]);
+    mockSubmit(unanchored);
+    const response = await post(unanchored);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    expect(json.metrics.totalTokens).toBe(240_000);
+    expect(storedTokens(store)).toBe(240_000);
+    expect(store.days.map((d) => d.date).sort()).toEqual(["2026-08-05", "2026-08-07"]);
+  });
+
   it("separately preserves and credits distinct Antigravity family sources (CLI and Extension)", async () => {
     const store = newStore();
     installTx(store);
