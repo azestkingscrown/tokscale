@@ -214,6 +214,7 @@ pub enum MessageKey {
     SessionDetailSectionOverview,
     SessionDetailSectionActivity,
     SessionDetailSectionTokens,
+    SessionDetailReasoning,
 
     // Status / Messages
     StatusLoadedFromCache,
@@ -661,6 +662,7 @@ const fn tr_en(key: MessageKey) -> &'static str {
         MessageKey::SessionDetailSectionOverview => "Session Overview",
         MessageKey::SessionDetailSectionActivity => "Activity",
         MessageKey::SessionDetailSectionTokens => "Tokens & Cost",
+        MessageKey::SessionDetailReasoning => "Reasoning",
 
         MessageKey::StatusLoadedFromCache => "Loaded from cache",
         MessageKey::StatusRefreshInProgress => "Refresh already in progress",
@@ -1078,6 +1080,7 @@ const fn tr_ko(key: MessageKey) -> Option<&'static str> {
         MessageKey::SessionDetailSectionOverview => "세션 개요",
         MessageKey::SessionDetailSectionActivity => "활동",
         MessageKey::SessionDetailSectionTokens => "토큰 및 비용",
+        MessageKey::SessionDetailReasoning => "추론",
 
         MessageKey::StatusLoadedFromCache => "캐시에서 불러옴",
         MessageKey::StatusRefreshInProgress => "새로고침이 이미 진행 중입니다",
@@ -1502,6 +1505,7 @@ const fn tr_ja(key: MessageKey) -> Option<&'static str> {
         MessageKey::SessionDetailSectionOverview => "セッション概要",
         MessageKey::SessionDetailSectionActivity => "アクティビティ",
         MessageKey::SessionDetailSectionTokens => "トークンとコスト",
+        MessageKey::SessionDetailReasoning => "推論",
 
         MessageKey::StatusLoadedFromCache => "キャッシュから読み込みました",
         MessageKey::StatusRefreshInProgress => "更新はすでに処理中です",
@@ -1917,6 +1921,7 @@ const fn tr_zh_cn(key: MessageKey) -> Option<&'static str> {
         MessageKey::SessionDetailSectionOverview => "会话概览",
         MessageKey::SessionDetailSectionActivity => "活动",
         MessageKey::SessionDetailSectionTokens => "Token 与费用",
+        MessageKey::SessionDetailReasoning => "推理",
 
         MessageKey::StatusLoadedFromCache => "已从缓存载入",
         MessageKey::StatusRefreshInProgress => "刷新已在进行中",
@@ -2324,6 +2329,7 @@ const fn tr_fr(key: MessageKey) -> Option<&'static str> {
         MessageKey::SessionDetailSectionOverview => "Vue d'ensemble de la session",
         MessageKey::SessionDetailSectionActivity => "Activité",
         MessageKey::SessionDetailSectionTokens => "Jetons et coût",
+        MessageKey::SessionDetailReasoning => "Raisonnement",
 
         MessageKey::StatusLoadedFromCache => "Chargé depuis le cache",
         MessageKey::StatusRefreshInProgress => "Actualisation déjà en cours",
@@ -2860,6 +2866,7 @@ mod tests {
             MessageKey::SessionDetailSectionOverview,
             MessageKey::SessionDetailSectionActivity,
             MessageKey::SessionDetailSectionTokens,
+            MessageKey::SessionDetailReasoning,
             MessageKey::StatusLoadedFromCache,
             MessageKey::StatusRefreshInProgress,
             MessageKey::StatusLanguageChanged,

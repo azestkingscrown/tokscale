@@ -26,7 +26,7 @@ use super::{DialogContent, DialogResult};
 pub struct SessionDetailDialog {
     session: SessionUsage,
     lang: TuiLanguage,
-    scroll_offset: usize,
+    scroll_offset: Cell<usize>,
     total_lines: Cell<usize>,
     visible_height: Cell<usize>,
 }
@@ -36,22 +36,16 @@ impl SessionDetailDialog {
         Self {
             session,
             lang,
-            scroll_offset: 0,
+            scroll_offset: Cell::new(0),
             total_lines: Cell::new(0),
             visible_height: Cell::new(0),
         }
     }
 
-    /// Access the underlying session usage.
-    #[allow(dead_code)]
-    pub fn session(&self) -> &SessionUsage {
-        &self.session
-    }
-
-    /// Current vertical scroll offset.
-    #[allow(dead_code)]
+    /// Current vertical scroll offset (for testing).
+    #[cfg(test)]
     pub fn scroll_offset(&self) -> usize {
-        self.scroll_offset
+        self.scroll_offset.get()
     }
 
     fn build_lines(&self, theme: &Theme, inner_width: u16) -> Vec<Line<'static>> {
@@ -294,7 +288,7 @@ impl SessionDetailDialog {
 
         if self.session.tokens.reasoning > 0 {
             lines.push(kv_line(
-                "Reasoning",
+                tr(self.lang, MessageKey::SessionDetailReasoning),
                 Span::styled(
                     format_tokens_with_commas(self.session.tokens.reasoning),
                     Style::default().fg(theme.foreground),
@@ -366,7 +360,8 @@ impl DialogContent for SessionDetailDialog {
         self.visible_height.set(visible_height);
 
         let max_scroll = total_lines.saturating_sub(visible_height);
-        let effective_scroll = self.scroll_offset.min(max_scroll);
+        let effective_scroll = self.scroll_offset.get().min(max_scroll);
+        self.scroll_offset.set(effective_scroll);
 
         let paragraph = Paragraph::new(lines).scroll((effective_scroll as u16, 0));
         frame.render_widget(paragraph, content_area);
@@ -401,11 +396,13 @@ impl DialogContent for SessionDetailDialog {
                     .total_lines
                     .get()
                     .saturating_sub(self.visible_height.get());
-                self.scroll_offset = (self.scroll_offset + 1).min(max_scroll);
+                self.scroll_offset
+                    .set((self.scroll_offset.get() + 1).min(max_scroll));
                 DialogResult::None
             }
             KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                self.scroll_offset
+                    .set(self.scroll_offset.get().saturating_sub(1));
                 DialogResult::None
             }
             KeyCode::PageDown => {
@@ -414,16 +411,18 @@ impl DialogContent for SessionDetailDialog {
                     .total_lines
                     .get()
                     .saturating_sub(self.visible_height.get());
-                self.scroll_offset = (self.scroll_offset + step).min(max_scroll);
+                self.scroll_offset
+                    .set((self.scroll_offset.get() + step).min(max_scroll));
                 DialogResult::None
             }
             KeyCode::PageUp => {
                 let step = self.visible_height.get().max(1);
-                self.scroll_offset = self.scroll_offset.saturating_sub(step);
+                self.scroll_offset
+                    .set(self.scroll_offset.get().saturating_sub(step));
                 DialogResult::None
             }
             KeyCode::Home => {
-                self.scroll_offset = 0;
+                self.scroll_offset.set(0);
                 DialogResult::None
             }
             KeyCode::End => {
@@ -431,7 +430,7 @@ impl DialogContent for SessionDetailDialog {
                     .total_lines
                     .get()
                     .saturating_sub(self.visible_height.get());
-                self.scroll_offset = max_scroll;
+                self.scroll_offset.set(max_scroll);
                 DialogResult::None
             }
             _ => DialogResult::None,
@@ -445,11 +444,13 @@ impl DialogContent for SessionDetailDialog {
                     .total_lines
                     .get()
                     .saturating_sub(self.visible_height.get());
-                self.scroll_offset = (self.scroll_offset + 1).min(max_scroll);
+                self.scroll_offset
+                    .set((self.scroll_offset.get() + 1).min(max_scroll));
                 DialogResult::None
             }
             MouseEventKind::ScrollUp => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                self.scroll_offset
+                    .set(self.scroll_offset.get().saturating_sub(1));
                 DialogResult::None
             }
             _ => DialogResult::None,
@@ -498,10 +499,29 @@ fn wrapped_kv_lines(
     let label_width = UnicodeWidthStr::width(label);
     let pad = 16usize.saturating_sub(label_width);
     let prefix_colon = format!("{}: ", " ".repeat(pad));
-    let val_width = available_width
-        .saturating_sub(label_width + prefix_colon.len())
-        .max(10);
+    let prefix_width = label_width + prefix_colon.len();
 
+    // If available width cannot comfortably hold the prefix plus at least 6 chars of path,
+    // put the label on its own row so the path gets the full row width with a small 2-space indent.
+    if available_width <= prefix_width.saturating_add(6) {
+        let mut out = vec![Line::from(vec![
+            Span::styled(label.to_string(), Style::default().fg(theme.muted)),
+            Span::styled(":", Style::default().fg(theme.muted)),
+        ])];
+        let val_width = available_width.saturating_sub(2).max(1);
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            let (chunk, rest) = chunk_str_to_width(remaining, val_width);
+            remaining = rest;
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(chunk.to_string(), Style::default().fg(color)),
+            ]));
+        }
+        return out;
+    }
+
+    let val_width = available_width.saturating_sub(prefix_width).max(1);
     if text.is_empty() || UnicodeWidthStr::width(text) <= val_width {
         return vec![Line::from(vec![
             Span::styled(label.to_string(), Style::default().fg(theme.muted)),
@@ -510,7 +530,7 @@ fn wrapped_kv_lines(
         ])];
     }
 
-    let indent_spaces = " ".repeat(label_width + prefix_colon.len());
+    let indent_spaces = " ".repeat(prefix_width);
     let mut out = Vec::new();
     let mut remaining = text;
     let mut first = true;
@@ -807,7 +827,54 @@ mod tests {
         assert!(rendered_text.contains("gpt-4o"));
         assert!(rendered_text.contains("primary"));
         assert!(rendered_text.contains("coder"));
+        assert!(rendered_text.contains("Reasoning"));
         assert!(rendered_text.contains("Esc/q/Enter/i close"));
+    }
+
+    #[test]
+    fn test_session_detail_dialog_scroll_clamped_on_render() {
+        let session = test_session();
+        let dialog = SessionDetailDialog::new(session, TuiLanguage::En);
+        dialog.scroll_offset.set(100);
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = test_theme();
+
+        terminal
+            .draw(|f| {
+                dialog.render(f, Rect::new(0, 0, 80, 20), &theme);
+            })
+            .unwrap();
+
+        let max_scroll = dialog
+            .total_lines
+            .get()
+            .saturating_sub(dialog.visible_height.get());
+        assert_eq!(dialog.scroll_offset(), max_scroll);
+        assert!(dialog.scroll_offset() < 100);
+    }
+
+    #[test]
+    fn test_session_detail_dialog_narrow_terminal_directory_wrapping() {
+        let mut session = test_session();
+        session.workspace_key = Some("/very/long/nested/path/to/project/workspace".to_string());
+        let dialog = SessionDetailDialog::new(session, TuiLanguage::En);
+
+        let backend = TestBackend::new(25, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = test_theme();
+
+        terminal
+            .draw(|f| {
+                dialog.render(f, Rect::new(0, 0, 25, 20), &theme);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered_text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(rendered_text.contains("Directory"));
+        assert!(rendered_text.contains("/very/long"));
     }
 
     #[test]
