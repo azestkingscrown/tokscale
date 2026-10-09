@@ -904,7 +904,7 @@ describe("POST /api/submit Antigravity family high-water", () => {
     expect(store.days.map((d) => d.date).sort()).toEqual(["2026-08-05", "2026-08-07"]);
   });
 
-  it("freezes when a deficit snapshot introduces new dates without anchoring on lastCreditedDate", async () => {
+  it("credits new dates when deficit snapshot anchors on earliest retained date even if lastCreditedDate was pruned or sparse", async () => {
     const store = newStore();
     installTx(store);
     const first = submissionBody("antigravity-cli", [
@@ -916,21 +916,75 @@ describe("POST /api/submit Antigravity family high-water", () => {
     expect(storedTokens(store)).toBe(240_000);
 
     // Deficit snapshot that contains 08-05 and 09-01, but misses lastCreditedDate (08-07).
-    // Because it fails to anchor on lastCreditedDate, it cannot prove continuity against
-    // the credited boundary and must freeze.
+    // Because minIncomingDate (08-05) <= lastCreditedDate (08-07), historical continuity
+    // is proven without depending on the single boundary date surviving retention.
     installTx(store);
-    const unanchored = submissionBody("antigravity-cli", [
+    const anchored = submissionBody("antigravity-cli", [
       { date: "2026-08-05", tokens: 80_000, messages: 4 },
       { date: "2026-09-01", tokens: 50_000, messages: 2 },
     ]);
-    mockSubmit(unanchored);
-    const response = await post(unanchored);
+    mockSubmit(anchored);
+    const response = await post(anchored);
     expect(response.status).toBe(200);
     const json = await response.json();
 
+    // 240,000 floor preserved, +50,000 on 2026-09-01 admitted = 290,000
+    expect(json.metrics.totalTokens).toBe(290_000);
+    expect(storedTokens(store)).toBe(290_000);
+    expect(store.days.map((d) => d.date).sort()).toEqual(["2026-08-05", "2026-08-07", "2026-09-01"]);
+  });
+
+  it("credits new dates when earliest retained date is adjacent to the stored tail", async () => {
+    const store = newStore();
+    installTx(store);
+    const first = submissionBody("antigravity-cli", [
+      { date: "2026-08-07", tokens: 240_000, messages: 10 },
+    ]);
+    mockSubmit(first);
+    expect((await post(first)).status).toBe(200);
+    expect(storedTokens(store)).toBe(240_000);
+
+    // Older days up to 08-07 pruned from local store, new activity begins on adjacent day 08-08.
+    // minIncomingDate (08-08) is adjacent to stored tail (08-07), so 08-08 is credited.
+    installTx(store);
+    const adjacent = submissionBody("antigravity-cli", [
+      { date: "2026-08-08", tokens: 50_000, messages: 2 },
+    ]);
+    mockSubmit(adjacent);
+    const response = await post(adjacent);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    // 240,000 floor preserved + 50,000 on 08-08 = 290,000
+    expect(json.metrics.totalTokens).toBe(290_000);
+    expect(storedTokens(store)).toBe(290_000);
+    expect(store.days.map((d) => d.date).sort()).toEqual(["2026-08-07", "2026-08-08"]);
+  });
+
+  it("freezes when a deficit snapshot introduces new dates with an unanchored disjoint jump", async () => {
+    const store = newStore();
+    installTx(store);
+    const first = submissionBody("antigravity-cli", [
+      { date: "2026-08-07", tokens: 240_000, messages: 10 },
+    ]);
+    mockSubmit(first);
+    expect((await post(first)).status).toBe(200);
+    expect(storedTokens(store)).toBe(240_000);
+
+    // Deficit snapshot with a completely unanchored disjoint jump (minIncomingDate 09-01 is weeks after 08-07).
+    installTx(store);
+    const disjoint = submissionBody("antigravity-cli", [
+      { date: "2026-09-01", tokens: 50_000, messages: 2 },
+    ]);
+    mockSubmit(disjoint);
+    const response = await post(disjoint);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    // Freezes without crediting disjoint jump under deficit
     expect(json.metrics.totalTokens).toBe(240_000);
     expect(storedTokens(store)).toBe(240_000);
-    expect(store.days.map((d) => d.date).sort()).toEqual(["2026-08-05", "2026-08-07"]);
+    expect(store.days.map((d) => d.date).sort()).toEqual(["2026-08-07"]);
   });
 
   it("separately preserves and credits distinct Antigravity family sources (CLI and Extension)", async () => {

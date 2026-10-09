@@ -83,6 +83,15 @@ function covers(previous: Coverage, incoming?: Coverage): boolean {
   });
 }
 
+function isAdjacentDay(dateA: string, dateB: string): boolean {
+  const [y1, m1, d1] = dateA.split("-").map(Number);
+  const [y2, m2, d2] = dateB.split("-").map(Number);
+  const t1 = Date.UTC(y1, m1 - 1, d1);
+  const t2 = Date.UTC(y2, m2 - 1, d2);
+  const diffDays = Math.round(Math.abs(t2 - t1) / (24 * 60 * 60 * 1000));
+  return diffDays <= 1;
+}
+
 /**
  * Antigravity's desktop cache, CLI, and IDE extension can contain the same
  * provider response. Their source labels are presentation surfaces, not
@@ -217,19 +226,28 @@ export function planAntigravityTransition(args: {
       // 1. The device must already have completed parser generation migration (persistedVersions >= 1),
       //    guaranteeing that per-turn event dating is already established and no generations can be re-dated
       //    from older dates to newer dates across versions.
-      // 2. The incoming snapshot must anchor directly on lastCreditedDate (the boundary of credited history),
-      //    proving unbroken historical continuity rather than an unverified disjoint jump.
+      // 2. The incoming snapshot's retained history must anchor to credited history:
+      //    either overlapping on or before lastCreditedDate, or directly adjacent to the stored tail,
+      //    proving historical continuity without depending on a single boundary day surviving rolling retention.
       // 3. Activity extends strictly beyond lastCreditedDate into genuinely new dates.
       const isAlreadyMigrated = ANTIGRAVITY_FAMILY.every((client) => {
         const persisted = ownValue(args.persistedVersions ?? {}, client);
         return persisted !== undefined && persisted >= 1;
       });
 
-      const anchorsOnLastCreditedDate =
-        lastCreditedDate !== undefined && incomingFamilyDates.has(lastCreditedDate);
+      const minIncomingDate =
+        incomingFamilyDates.size > 0
+          ? [...incomingFamilyDates].reduce((min, d) => (d < min ? d : min))
+          : undefined;
+
+      const anchorsOnRetainedHistory =
+        lastCreditedDate !== undefined &&
+        minIncomingDate !== undefined &&
+        (minIncomingDate <= lastCreditedDate ||
+          isAdjacentDay(lastCreditedDate, minIncomingDate));
 
       const newDates = new Set<string>();
-      if (lastCreditedDate && anchorsOnLastCreditedDate && isAlreadyMigrated) {
+      if (lastCreditedDate && anchorsOnRetainedHistory && isAlreadyMigrated) {
         for (const date of incomingFamilyDates) {
           if (date > lastCreditedDate) {
             newDates.add(date);
