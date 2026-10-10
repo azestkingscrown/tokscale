@@ -3891,8 +3891,10 @@ mod tests {
 
     #[test]
     fn test_thread_id_from_rollout_path_handles_plain_and_compressed_zst() {
-        let plain = Path::new("rollout-2026-08-30T10-00-00-550e8400-e29b-41d4-a716-446655440000.jsonl");
-        let compressed = Path::new("rollout-2026-08-30T10-00-00-550e8400-e29b-41d4-a716-446655440000.jsonl.zst");
+        let plain =
+            Path::new("rollout-2026-08-30T10-00-00-550e8400-e29b-41d4-a716-446655440000.jsonl");
+        let compressed =
+            Path::new("rollout-2026-08-30T10-00-00-550e8400-e29b-41d4-a716-446655440000.jsonl.zst");
         assert_eq!(
             thread_id_from_rollout_path(plain),
             Some("550e8400-e29b-41d4-a716-446655440000".to_string())

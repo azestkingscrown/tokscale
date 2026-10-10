@@ -1986,56 +1986,56 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     if fingerprint.size > codex_incremental.consumed_offset
                         && message_cache::codex_prefix_matches(path, codex_incremental)
                     {
-                    let parsed = sessions::codex::parse_codex_file_incremental(
-                        path,
-                        codex_incremental.consumed_offset,
-                        codex_incremental.state.clone(),
-                    );
-                    if parsed.parse_succeeded && !parsed.unresolved_model_events {
-                        let mut raw_messages = cached.messages.clone();
-                        let mut fallback_timestamp_indices =
-                            cached.fallback_timestamp_indices.clone();
-                        let existing_len = raw_messages.len();
-                        fallback_timestamp_indices.extend(
-                            parsed
-                                .fallback_timestamp_indices
-                                .iter()
-                                .map(|index| existing_len + index),
-                        );
-                        raw_messages.extend(parsed.messages);
-                        let turn_coverage = parsed.state.turn_coverage.clone();
-                        let cache_entry = build_codex_cache_entry(
+                        let parsed = sessions::codex::parse_codex_file_incremental(
                             path,
-                            raw_messages.clone(),
-                            parsed.consumed_offset,
-                            parsed.state,
-                            fallback_timestamp_indices.clone(),
+                            codex_incremental.consumed_offset,
+                            codex_incremental.state.clone(),
                         );
-                        if let Some(cache_entry) = cache_entry {
-                            let messages = finalize_codex_messages(
-                                raw_messages,
-                                pricing,
-                                is_headless,
-                                &fallback_timestamp_indices,
-                                fallback_timestamp,
+                        if parsed.parse_succeeded && !parsed.unresolved_model_events {
+                            let mut raw_messages = cached.messages.clone();
+                            let mut fallback_timestamp_indices =
+                                cached.fallback_timestamp_indices.clone();
+                            let existing_len = raw_messages.len();
+                            fallback_timestamp_indices.extend(
+                                parsed
+                                    .fallback_timestamp_indices
+                                    .iter()
+                                    .map(|index| existing_len + index),
                             );
+                            raw_messages.extend(parsed.messages);
+                            let turn_coverage = parsed.state.turn_coverage.clone();
+                            let cache_entry = build_codex_cache_entry(
+                                path,
+                                raw_messages.clone(),
+                                parsed.consumed_offset,
+                                parsed.state,
+                                fallback_timestamp_indices.clone(),
+                            );
+                            if let Some(cache_entry) = cache_entry {
+                                let messages = finalize_codex_messages(
+                                    raw_messages,
+                                    pricing,
+                                    is_headless,
+                                    &fallback_timestamp_indices,
+                                    fallback_timestamp,
+                                );
 
-                            return (
-                                CachedParseOutcome {
-                                    messages,
-                                    retained_message_keys: HashSet::new(),
-                                    cache_entry: Some(cache_entry),
-                                    invalidate_cache: false,
-                                },
-                                turn_coverage,
-                            );
+                                return (
+                                    CachedParseOutcome {
+                                        messages,
+                                        retained_message_keys: HashSet::new(),
+                                        cache_entry: Some(cache_entry),
+                                        invalidate_cache: false,
+                                    },
+                                    turn_coverage,
+                                );
+                            }
                         }
                     }
                 }
             }
-        }
 
-        return reparse_from_start(true);
+            return reparse_from_start(true);
         }
 
         unreachable!("uncached Codex sources return before fingerprint validation")
@@ -19985,7 +19985,10 @@ mod tests {
         assert_eq!(compressed_messages.len(), 1);
         assert_eq!(compressed_messages[0].tokens.total(), 160);
         assert_eq!(compressed_messages[0].tokens, plain_messages[0].tokens);
-        assert_eq!(compressed_messages[0].session_id, plain_messages[0].session_id);
+        assert_eq!(
+            compressed_messages[0].session_id,
+            plain_messages[0].session_id
+        );
         assert_eq!(compressed_messages[0].model_id, plain_messages[0].model_id);
 
         // 4. Verify cache persistence for the .zst file.

@@ -7084,7 +7084,11 @@ fn test_codex_compressed_session_reports_usage() {
         "\n"
     );
     let compressed_file = sessions.join("fixture.jsonl.zst");
-    fs::write(&compressed_file, zstd::encode_all(content.as_bytes(), 0).unwrap()).unwrap();
+    fs::write(
+        &compressed_file,
+        zstd::encode_all(content.as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
 
     let output = cmd_with_home(tmp.path())
         .args(["--client", "codex", "--json", "--no-spinner"])

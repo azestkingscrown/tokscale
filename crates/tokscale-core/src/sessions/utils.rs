@@ -546,7 +546,8 @@ pub(crate) const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// True when a path has a `.zst` file extension.
 pub(crate) fn is_zst_path(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zst"))
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zst"))
 }
 
 /// Read a zstd-compressed archive file with a bounded decompressed byte limit.
