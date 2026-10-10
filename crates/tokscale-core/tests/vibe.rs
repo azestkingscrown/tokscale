@@ -195,3 +195,70 @@ async fn test_vibe_end_to_end_discovers_sessions_and_reports_counts() {
         1
     );
 }
+
+#[test]
+fn test_vibe_empty_origin_directory_falls_back_to_environment_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta_file = dir.path().join("meta.json");
+
+    let json = r#"{
+        "session_id": "sess-empty-origin",
+        "origin_directory": "   ",
+        "environment": {
+            "working_directory": "/home/ubuntu/workspace"
+        },
+        "stats": {
+            "session_prompt_tokens": 100,
+            "session_completion_tokens": 50
+        }
+    }"#;
+    fs::write(&meta_file, json).unwrap();
+
+    let msgs = parse_vibe_file(&meta_file);
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(
+        msgs[0].workspace_key.as_deref(),
+        Some("/home/ubuntu/workspace")
+    );
+    assert_eq!(msgs[0].dedup_key.as_deref(), Some("vibe:sess-empty-origin"));
+}
+
+#[tokio::test]
+async fn test_vibe_deduplicates_duplicate_session_copies() {
+    let home_dir = common::temp_home();
+    let home = home_dir.path();
+
+    let meta_json = r#"{
+        "session_id": "sess-duplicate",
+        "start_time": "2026-10-10T10:00:00Z",
+        "config": { "active_model": "mistral-small-latest" },
+        "stats": {
+            "steps": 2,
+            "session_prompt_tokens": 1000,
+            "session_completion_tokens": 100
+        }
+    }"#;
+
+    write_vibe_session(home, "session_20261010_100000_original", meta_json);
+    write_vibe_session(home, "session_20261010_100000_copy", meta_json);
+
+    let pricing = make_pricing_service();
+    let messages =
+        parse_local_unified_messages_with_pricing_uncached(vibe_options(home), Some(&pricing))
+            .await
+            .unwrap();
+
+    assert_eq!(
+        messages.len(),
+        1,
+        "identical session copies must be deduplicated"
+    );
+    assert_eq!(messages[0].session_id, "sess-duplicate");
+    assert_eq!(
+        messages[0].dedup_key.as_deref(),
+        Some("vibe:sess-duplicate")
+    );
+
+    let parsed = parse_local_clients(vibe_options(home)).unwrap();
+    assert_eq!(parsed.messages.len(), 1);
+}

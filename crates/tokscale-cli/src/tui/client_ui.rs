@@ -92,7 +92,6 @@ pub fn compact_display_name(client: ClientId) -> &'static str {
         // "DeepSeek Harness" (16 cells) overflows the 15-cell Client column.
         ClientId::Dsh => "DeepSeek",
         ClientId::AntigravityExtension => "Antigravity Ext",
-        ClientId::Vibe => "Vibe",
         _ => display_name(client),
     }
 }

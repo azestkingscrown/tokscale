@@ -113,19 +113,30 @@ pub fn parse_vibe_file(path: &Path) -> Vec<UnifiedMessage> {
     let canonical_prov = provider_identity::canonical_provider(inferred);
     let provider = canonical_prov.as_deref().unwrap_or(inferred);
 
+    let dedup_key = format!("vibe:{session_id}");
+
     let mut message = UnifiedMessage::new_with_dedup(
-        "vibe", model, provider, session_id, timestamp, tokens, 0.0, None,
+        "vibe",
+        model,
+        provider,
+        session_id,
+        timestamp,
+        tokens,
+        0.0,
+        Some(dedup_key),
     );
 
     let origin_dir = meta
         .get("origin_directory")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
         .or_else(|| {
             meta.pointer("/environment/working_directory")
                 .and_then(Value::as_str)
-        })
-        .map(str::trim)
-        .filter(|d| !d.is_empty());
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+        });
 
     if let Some(dir) = origin_dir {
         let workspace_key = normalize_workspace_key(dir);
