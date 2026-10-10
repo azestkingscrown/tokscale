@@ -12,14 +12,14 @@
 
 use super::utils::{
     extract_i64, extract_string, file_modified_timestamp_ms, is_zst_path, parse_timestamp_value,
-    read_archive, session_id_from_path, MAX_ARCHIVE_BYTES,
+    session_id_from_path, MAX_ARCHIVE_BYTES,
 };
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::provider_identity::inferred_provider_from_model;
 use crate::TokenBreakdown;
 use serde::Deserialize;
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// Agents-tab bucket for a regular interactive Codex thread. Codex stamps each
@@ -1386,8 +1386,8 @@ pub(crate) fn parse_codex_file_incremental(
             };
         }
 
-        let bytes = match read_archive(path, MAX_ARCHIVE_BYTES) {
-            Ok(bytes) => bytes,
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "Skipping Codex archive");
                 return ParsedCodexFile {
@@ -1400,8 +1400,41 @@ pub(crate) fn parse_codex_file_incremental(
                 };
             }
         };
-        let reader = std::io::Cursor::new(bytes);
-        return parse_codex_reader(reader, &session_id, fallback_timestamp, 0, state);
+
+        let mut decoder = match zstd::stream::read::Decoder::new(file) {
+            Ok(d) => d,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "Skipping Codex archive");
+                return ParsedCodexFile {
+                    messages: Vec::new(),
+                    fallback_timestamp_indices: Vec::new(),
+                    consumed_offset: 0,
+                    parse_succeeded: false,
+                    unresolved_model_events: false,
+                    state,
+                };
+            }
+        };
+        if let Err(error) = decoder.window_log_max(26) {
+            tracing::warn!(path = %path.display(), %error, "Skipping Codex archive");
+            return ParsedCodexFile {
+                messages: Vec::new(),
+                fallback_timestamp_indices: Vec::new(),
+                consumed_offset: 0,
+                parse_succeeded: false,
+                unresolved_model_events: false,
+                state,
+            };
+        }
+
+        let reader = BufReader::new(decoder.take(MAX_ARCHIVE_BYTES + 1));
+        let mut parsed = parse_codex_reader(reader, &session_id, fallback_timestamp, 0, state);
+        if parsed.consumed_offset > MAX_ARCHIVE_BYTES || !parsed.parse_succeeded {
+            parsed.messages.clear();
+            parsed.fallback_timestamp_indices.clear();
+            parsed.parse_succeeded = false;
+        }
+        return parsed;
     }
 
     let mut file = match std::fs::File::open(path) {
