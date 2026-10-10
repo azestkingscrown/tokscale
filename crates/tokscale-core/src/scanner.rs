@@ -6825,10 +6825,9 @@ mod tests {
         .unwrap();
         fs::write(sessions.join("unrelated.zst"), b"not a session").unwrap();
 
-        let previous_codex = std::env::var("CODEX_HOME").ok();
-        unsafe { std::env::set_var("CODEX_HOME", dir.path().join(".codex")) };
+        let mut env = EnvGuard::capture(&["CODEX_HOME"]);
+        env.set("CODEX_HOME", dir.path().join(".codex"));
         let scan = scan_without_extra_dirs(dir.path().to_str().unwrap(), &["codex".to_string()]);
-        restore_env("CODEX_HOME", previous_codex);
 
         assert_eq!(scan.get(ClientId::Codex).len(), 2);
         for path in scan.get(ClientId::Codex) {

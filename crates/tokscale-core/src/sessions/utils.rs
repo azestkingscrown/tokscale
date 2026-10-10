@@ -542,7 +542,7 @@ pub(crate) fn estimate_tokens(chars: usize) -> i64 {
 }
 
 /// Bounded limit for decompressing archived transcripts (.zst) into memory.
-pub(crate) const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// True when a path has a `.zst` file extension.
 pub(crate) fn is_zst_path(path: &Path) -> bool {

@@ -35,12 +35,12 @@
 
 use super::utils::{
     file_modified_timestamp_ms, for_each_json_line, lossy_lines, open_readonly_sqlite,
-    parse_json_line, read_file_or_none, sqlite_for_each_row_on, timestamp_secs_to_ms, CamelUsage,
+    parse_json_line, read_archive, read_file_or_none, sqlite_for_each_row_on, timestamp_secs_to_ms,
+    CamelUsage, MAX_ARCHIVE_BYTES,
 };
 use super::UnifiedMessage;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -183,24 +183,6 @@ pub(crate) fn classify_openclaw_jsonl(path: &Path) -> OpenClawJsonlKind {
 /// in WAL mode while the gateway runs, so readers normally never block, but a
 /// checkpoint or recovery can hold an exclusive lock for a moment.
 const OPENCLAW_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(1500);
-
-// Archived transcripts are immutable zstd files. Bound expansion before parsing
-// so a corrupt archive cannot allocate its advertised decoded size.
-const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
-
-fn read_archive(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let mut decoder = zstd::stream::read::Decoder::new(file)?;
-    decoder.window_log_max(26)?;
-    let mut bytes = Vec::new();
-    decoder.take(max_bytes + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(std::io::Error::other(
-            "decoded transcript exceeds archive limit",
-        ));
-    }
-    Ok(bytes)
-}
 
 fn for_each_transcript_line(path: &Path, sink: &mut dyn FnMut(usize, &str)) {
     if path.extension().is_none_or(|extension| extension != "zst") {
