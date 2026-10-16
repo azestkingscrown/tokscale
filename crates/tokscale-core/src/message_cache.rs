@@ -4180,6 +4180,7 @@ mod tests {
             SOURCE_CACHE_ABORT_POINT_ENV,
             SOURCE_CACHE_ABORT_PATHS_ENV,
             SOURCE_CACHE_ABORT_MARKER_ENV,
+            "TOKSCALE_CODEX_MAX_DECODED_BYTES",
         ]);
         env.set("HOME", temp_home);
         env.set("XDG_CONFIG_HOME", temp_home.join(".config"));
@@ -4201,6 +4202,7 @@ mod tests {
         env.remove(SOURCE_CACHE_ABORT_POINT_ENV);
         env.remove(SOURCE_CACHE_ABORT_PATHS_ENV);
         env.remove(SOURCE_CACHE_ABORT_MARKER_ENV);
+        env.remove("TOKSCALE_CODEX_MAX_DECODED_BYTES");
         env
     }
 
@@ -4927,7 +4929,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_codex_parser_version_invalidates_v11_entries() {
+        let mut env =
+            crate::paths::test_env::EnvGuard::capture(&["TOKSCALE_CODEX_MAX_DECODED_BYTES"]);
+        env.remove("TOKSCALE_CODEX_MAX_DECODED_BYTES");
+
         // v6->v7 splits `reasoning_output_tokens` out of the Codex output
         // bucket, v7->v8 retags rollouts OpenClaw originated as openclaw, and
         // v8->v9 buckets agent attribution into "Codex" / "Codex Subagent" /
@@ -4953,6 +4960,12 @@ mod tests {
         let another_capped_version = codex_parser_version_for_limit(1024);
         assert_ne!(another_capped_version, capped_version);
         assert_ne!(another_capped_version, 18);
+
+        env.set("TOKSCALE_CODEX_MAX_DECODED_BYTES", "64");
+        assert_eq!(parser_version(ClientId::Codex), capped_version);
+
+        env.remove("TOKSCALE_CODEX_MAX_DECODED_BYTES");
+        assert_eq!(parser_version(ClientId::Codex), 18);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 
