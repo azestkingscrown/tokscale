@@ -7418,4 +7418,24 @@ fn test_codex_compressed_session_respects_max_decoded_bytes_env() {
     assert_eq!(raised_json["totalOutput"].as_i64().unwrap(), 10);
     assert_eq!(raised_json["totalMessages"].as_i64().unwrap(), 1);
     assert_eq!(raised_json["entries"][0]["reasoning"].as_i64().unwrap(), 10);
+
+    // Lowering the limit on the populated cache must invalidate the entry and reparse,
+    // skipping the archive rather than serving the cached entry.
+    let recapped_output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "64")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        recapped_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&recapped_output.stderr)
+    );
+    let recapped_stderr = String::from_utf8_lossy(&recapped_output.stderr);
+    assert!(
+        recapped_stderr.contains("1 exceeded the 64-byte decoded-size limit"),
+        "stderr: {recapped_stderr}"
+    );
+    let recapped_json: serde_json::Value = serde_json::from_slice(&recapped_output.stdout).unwrap();
+    assert_eq!(recapped_json["totalMessages"].as_i64().unwrap(), 0);
 }

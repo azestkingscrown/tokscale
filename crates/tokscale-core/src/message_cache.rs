@@ -1359,6 +1359,38 @@ fn shared_family_version(client: ClientId) -> Option<u32> {
     first.map(|(_, version)| version)
 }
 
+const CODEX_PARSER_BASE_VERSION: u32 = 18;
+
+pub(crate) fn codex_parser_version_for_limit(limit: u64) -> u32 {
+    if limit == crate::sessions::codex::MAX_CODEX_ARCHIVE_BYTES {
+        CODEX_PARSER_BASE_VERSION
+    } else {
+        // Fold the configured byte limit into the parser version so changing
+        // TOKSCALE_CODEX_MAX_DECODED_BYTES invalidates cached Codex entries.
+        const FNV_OFFSET_BASIS_32: u32 = 0x811c_9dc5;
+        const FNV_PRIME_32: u32 = 0x0100_0193;
+
+        let mut acc = FNV_OFFSET_BASIS_32;
+        for byte in CODEX_PARSER_BASE_VERSION.to_le_bytes() {
+            acc ^= u32::from(byte);
+            acc = acc.wrapping_mul(FNV_PRIME_32);
+        }
+        for byte in limit.to_le_bytes() {
+            acc ^= u32::from(byte);
+            acc = acc.wrapping_mul(FNV_PRIME_32);
+        }
+        if acc == 0 || acc == CODEX_PARSER_BASE_VERSION {
+            CODEX_PARSER_BASE_VERSION.wrapping_add(1)
+        } else {
+            acc
+        }
+    }
+}
+
+fn codex_parser_version() -> u32 {
+    codex_parser_version_for_limit(crate::sessions::codex::max_codex_archive_bytes())
+}
+
 fn parser_version(client: ClientId) -> u32 {
     // Shared-family members are versioned by the roster alone: their
     // version is their family's base plus their declared offset, so a
@@ -1443,7 +1475,9 @@ fn parser_version(client: ClientId) -> u32 {
         // v17->v18: settle pending token_usage_record rows when turn_aborted or
         // task_complete ends their turn. Completed v17 rollouts keep the same
         // fingerprint, so their undercounted entries must be reparsed.
-        ClientId::Codex => 18,
+        // Changing TOKSCALE_CODEX_MAX_DECODED_BYTES folds the active limit into
+        // this version so rollouts cached under a larger limit reparse when capped.
+        ClientId::Codex => codex_parser_version(),
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -4909,6 +4943,16 @@ mod tests {
         // Each bump is what stops an existing cache from replaying the old
         // rows, so it has to be asserted rather than assumed.
         assert_eq!(parser_version(ClientId::Codex), 18);
+        assert_eq!(
+            codex_parser_version_for_limit(crate::sessions::codex::MAX_CODEX_ARCHIVE_BYTES),
+            18
+        );
+        let capped_version = codex_parser_version_for_limit(64);
+        assert_ne!(capped_version, 18);
+        assert_ne!(capped_version, 0);
+        let another_capped_version = codex_parser_version_for_limit(1024);
+        assert_ne!(another_capped_version, capped_version);
+        assert_ne!(another_capped_version, 18);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 
