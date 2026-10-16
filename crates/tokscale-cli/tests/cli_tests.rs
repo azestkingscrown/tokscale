@@ -7353,3 +7353,69 @@ fn test_codex_compressed_session_reports_usage() {
         assert_eq!(json["entries"][0]["reasoning"].as_i64().unwrap(), 10);
     }
 }
+
+#[test]
+fn test_codex_compressed_session_respects_max_decoded_bytes_env() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+
+    let content = concat!(
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#,
+        "\n"
+    );
+    let compressed_file = sessions.join("fixture.jsonl.zst");
+    fs::write(
+        &compressed_file,
+        zstd::encode_all(content.as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+
+    let capped_output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "64")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        capped_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&capped_output.stderr)
+    );
+    let capped_stderr = String::from_utf8_lossy(&capped_output.stderr);
+    assert!(
+        capped_stderr.contains("1 exceeded the 64-byte decoded-size limit"),
+        "stderr: {capped_stderr}"
+    );
+    assert!(
+        capped_stderr.contains("decoded size limit exceeded: more than 64 bytes"),
+        "stderr: {capped_stderr}"
+    );
+    let capped_json: serde_json::Value = serde_json::from_slice(&capped_output.stdout).unwrap();
+    assert_eq!(capped_json["totalMessages"].as_i64().unwrap(), 0);
+
+    // Raising the decoded limit recovers the previously skipped archive because
+    // failed archive parses are never cached.
+    let raised_output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "4096")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        raised_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&raised_output.stderr)
+    );
+    let raised_stderr = String::from_utf8_lossy(&raised_output.stderr);
+    assert!(
+        !raised_stderr.contains("unreadable compressed Codex rollout"),
+        "stderr: {raised_stderr}"
+    );
+    let raised_json: serde_json::Value = serde_json::from_slice(&raised_output.stdout).unwrap();
+    assert_eq!(raised_json["totalInput"].as_i64().unwrap(), 110);
+    assert_eq!(raised_json["totalCacheRead"].as_i64().unwrap(), 30);
+    assert_eq!(raised_json["totalOutput"].as_i64().unwrap(), 10);
+    assert_eq!(raised_json["totalMessages"].as_i64().unwrap(), 1);
+    assert_eq!(raised_json["entries"][0]["reasoning"].as_i64().unwrap(), 10);
+}

@@ -1292,6 +1292,14 @@ fn codex_missing_usage_warning(missing_files: usize, inspected_files: usize) -> 
     })
 }
 
+fn format_codex_archive_limit_label(limit_bytes: u64) -> String {
+    if limit_bytes.is_multiple_of(1024 * 1024) {
+        format!("{} MiB", limit_bytes / (1024 * 1024))
+    } else {
+        format!("{limit_bytes}-byte")
+    }
+}
+
 fn codex_archive_failure_warning(
     mut failures: Vec<sessions::codex::CodexArchiveFailure>,
 ) -> Option<String> {
@@ -1327,9 +1335,10 @@ fn codex_archive_failure_warning(
         ));
     }
     if size_limit_failures > 0 {
-        let limit_mib = sessions::codex::MAX_CODEX_ARCHIVE_BYTES / (1024 * 1024);
+        let limit_label =
+            format_codex_archive_limit_label(sessions::codex::max_codex_archive_bytes());
         categories.push(format!(
-            "{size_limit_failures} exceeded the {limit_mib} MiB decoded-size limit"
+            "{size_limit_failures} exceeded the {limit_label} decoded-size limit"
         ));
     }
     if open_failures > 0 {
@@ -9361,6 +9370,15 @@ mod tests {
             1,
             "the TUI warning must stay on one line"
         );
+        assert_eq!(
+            super::format_codex_archive_limit_label(1024 * 1024 * 1024),
+            "1024 MiB"
+        );
+        assert_eq!(
+            super::format_codex_archive_limit_label(2 * 1024 * 1024 * 1024),
+            "2048 MiB"
+        );
+        assert_eq!(super::format_codex_archive_limit_label(64), "64-byte");
     }
 
     #[test]
