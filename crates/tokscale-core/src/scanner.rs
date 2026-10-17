@@ -436,6 +436,26 @@ fn is_openclaw_compaction_checkpoint(file_name: &str) -> bool {
     !session_id.is_empty() && is_uuid(checkpoint_id)
 }
 
+/// Discover `<account>/sessions/<session>/messages.jsonl` under `~/.aside/u`.
+///
+/// Deliberately NOT `scan_directory`, and not expressible as a pattern there,
+/// for two reasons that are both load-bearing:
+///
+/// 1. `scan_directory` admits a symlinked file (`file_type.is_symlink() &&
+///    path.is_file()`) and walks with `WalkDir`'s default link-following off
+///    only for directories it has already entered. An Aside account tree sits
+///    beside `memory/`, `password-manager/`, `accounts.json` and per-site
+///    caches, so a transcript-shaped symlink is enough to read a credential
+///    file through the scanner. `symlink_metadata` refuses the link itself,
+///    which is why the checks below never follow one — see
+///    `aside_discovery_does_not_follow_account_or_transcript_symlinks`.
+/// 2. The layout has to be pinned at every level, not just by filename. A
+///    session's sibling `artifacts/` and `tmp/` directories hold downloads and
+///    screenshots, and only the exact
+///    `<account>/sessions/<session>/messages.jsonl` depth carries usage.
+///
+/// `ClientId::Aside`'s declared `pattern` is therefore inert: this function
+/// ignores it, and the generic walker is never asked for this client.
 fn scan_aside_accounts(root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let Ok(accounts) = std::fs::read_dir(root) else {
@@ -1543,26 +1563,34 @@ fn discover_crush_dbs(home_dir: &str, use_env_roots: bool) -> Vec<CrushDbSource>
     dbs
 }
 
-fn cline_additional_vscode_task_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+/// Task roots for a VS Code extension beyond the client's declared (Linux
+/// `~/.config/Code`) path: macOS `~/Library/Application Support/Code`, Windows
+/// `%APPDATA%/Code`, and VS Code Remote's `~/.vscode-server`.
+fn additional_vscode_task_roots(
+    home_dir: &str,
+    use_env_roots: bool,
+    extension_id: &str,
+) -> Vec<PathBuf> {
+    let tasks = format!("User/globalStorage/{extension_id}/tasks");
     let mut roots = vec![PathBuf::from(home_dir)
-        .join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks")];
+        .join("Library/Application Support/Code")
+        .join(&tasks)];
 
     if cfg!(target_os = "windows") && use_env_roots {
         if let Some(app_data) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
-            roots.push(
-                PathBuf::from(app_data)
-                    .join("Code/User/globalStorage/saoudrizwan.claude-dev/tasks"),
-            );
+            roots.push(PathBuf::from(app_data).join("Code").join(&tasks));
         }
     }
 
     roots.push(
         PathBuf::from(home_dir)
-            .join("AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev/tasks"),
+            .join("AppData/Roaming/Code")
+            .join(&tasks),
     );
     roots.push(
         PathBuf::from(home_dir)
-            .join(".vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks"),
+            .join(".vscode-server/data")
+            .join(&tasks),
     );
 
     roots
@@ -2536,16 +2564,11 @@ fn scan_all_clients_with_env_strategy_inner(
             local_path,
         );
 
-        let server_path = format!(
-            "{}/.vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline/tasks",
-            home_dir
-        );
-        push_unique_scan_task(
-            &mut tasks,
-            &mut seen_scan_roots,
-            ClientId::RooCode,
-            server_path,
-        );
+        for root in
+            additional_vscode_task_roots(home_dir, use_env_roots, "rooveterinaryinc.roo-cline")
+        {
+            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::RooCode, root);
+        }
     }
 
     if enabled.contains(&ClientId::KiloCode) {
@@ -2559,16 +2582,9 @@ fn scan_all_clients_with_env_strategy_inner(
             local_path,
         );
 
-        let server_path = format!(
-            "{}/.vscode-server/data/User/globalStorage/kilocode.kilo-code/tasks",
-            home_dir
-        );
-        push_unique_scan_task(
-            &mut tasks,
-            &mut seen_scan_roots,
-            ClientId::KiloCode,
-            server_path,
-        );
+        for root in additional_vscode_task_roots(home_dir, use_env_roots, "kilocode.kilo-code") {
+            push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::KiloCode, root);
+        }
     }
 
     if enabled.contains(&ClientId::Cline) {
@@ -2582,7 +2598,8 @@ fn scan_all_clients_with_env_strategy_inner(
             local_path,
         );
 
-        for root in cline_additional_vscode_task_roots(home_dir, use_env_roots) {
+        for root in additional_vscode_task_roots(home_dir, use_env_roots, "saoudrizwan.claude-dev")
+        {
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Cline, root);
         }
 
@@ -3037,6 +3054,9 @@ fn scan_all_clients_with_env_strategy_inner(
         tasks
             .into_par_iter()
             .map(|(client_id, path, pattern)| {
+                // Aside needs a layout- and symlink-aware walk that no
+                // `scan_directory` pattern can express; see
+                // `scan_aside_accounts` for why its declared pattern is inert.
                 let files = if client_id == ClientId::Aside {
                     scan_aside_accounts(Path::new(&path))
                 } else {
@@ -4732,26 +4752,31 @@ mod tests {
     }
 
     fn setup_mock_roocode_dir(base: &std::path::Path) {
-        let local = base
-            .join(".config/Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks/task-local");
-        let server = base.join(
-            ".vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline/tasks/task-server",
-        );
-        fs::create_dir_all(&local).unwrap();
-        fs::create_dir_all(&server).unwrap();
-        File::create(local.join("ui_messages.json")).unwrap();
-        File::create(server.join("ui_messages.json")).unwrap();
+        let tasks = "User/globalStorage/rooveterinaryinc.roo-cline/tasks";
+        for (root, task) in [
+            (".config/Code", "task-local"),
+            ("Library/Application Support/Code", "task-macos"),
+            ("AppData/Roaming/Code", "task-windows"),
+            (".vscode-server/data", "task-server"),
+        ] {
+            let task_dir = base.join(root).join(tasks).join(task);
+            fs::create_dir_all(&task_dir).unwrap();
+            File::create(task_dir.join("ui_messages.json")).unwrap();
+        }
     }
 
     fn setup_mock_kilocode_dir(base: &std::path::Path) {
-        let local =
-            base.join(".config/Code/User/globalStorage/kilocode.kilo-code/tasks/task-local");
-        let server = base
-            .join(".vscode-server/data/User/globalStorage/kilocode.kilo-code/tasks/task-server");
-        fs::create_dir_all(&local).unwrap();
-        fs::create_dir_all(&server).unwrap();
-        File::create(local.join("ui_messages.json")).unwrap();
-        File::create(server.join("ui_messages.json")).unwrap();
+        let tasks = "User/globalStorage/kilocode.kilo-code/tasks";
+        for (root, task) in [
+            (".config/Code", "task-local"),
+            ("Library/Application Support/Code", "task-macos"),
+            ("AppData/Roaming/Code", "task-windows"),
+            (".vscode-server/data", "task-server"),
+        ] {
+            let task_dir = base.join(root).join(tasks).join(task);
+            fs::create_dir_all(&task_dir).unwrap();
+            File::create(task_dir.join("ui_messages.json")).unwrap();
+        }
     }
 
     fn setup_mock_cline_dir(base: &std::path::Path) {
@@ -7696,7 +7721,7 @@ mod tests {
             &["roocode".to_string()],
             false,
         );
-        assert_eq!(result.get(ClientId::RooCode).len(), 2);
+        assert_eq!(result.get(ClientId::RooCode).len(), 4);
         assert!(result
             .get(ClientId::RooCode)
             .iter()
@@ -7714,7 +7739,7 @@ mod tests {
             &["kilocode".to_string()],
             false,
         );
-        assert_eq!(result.get(ClientId::KiloCode).len(), 2);
+        assert_eq!(result.get(ClientId::KiloCode).len(), 4);
         assert!(result
             .get(ClientId::KiloCode)
             .iter()
