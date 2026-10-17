@@ -1526,7 +1526,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         state: sessions::codex::CodexParseState,
         fallback_timestamp_indices: Vec<usize>,
     ) -> Option<message_cache::CachedSourceEntry> {
-        let fingerprint = message_cache::SourceFingerprint::from_path(path)?;
+        let fingerprint = message_cache::SourceFingerprint::from_codex_path(path)?;
         let codex_incremental = if sessions::utils::is_zst_path(path) {
             message_cache::CodexIncrementalCache {
                 state,
@@ -2443,7 +2443,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             // only to discard that digest before parsing it.
             return parse_full_log_source(path, pricing, is_headless);
         }
-        let Some(fingerprint_status) = message_cache::SourceFingerprint::check_path(
+        let Some(fingerprint_status) = message_cache::SourceFingerprint::check_codex_path(
             path,
             cached.as_ref().map(|entry| &entry.fingerprint),
         ) else {

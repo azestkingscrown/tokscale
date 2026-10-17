@@ -341,6 +341,20 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, std::iter::empty())
     }
 
+    /// Fingerprint a Codex source together with the exact decoded archive limit
+    /// that governs compressed rollouts. The virtual related-file marker reuses
+    /// the existing cache wire layout, so retained-history cache formats do not
+    /// need a lossy global migration for this Codex-only parser input.
+    pub(crate) fn from_codex_path(path: &Path) -> Option<Self> {
+        let mut fingerprint = Self::from_path(path)?;
+        if crate::sessions::utils::is_zst_path(path) {
+            fingerprint
+                .related_files
+                .push(codex_archive_limit_fingerprint(path));
+        }
+        Some(fingerprint)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_sqlite_path(path: &Path) -> Option<Self> {
         let related_paths = ["-wal"]
@@ -470,6 +484,26 @@ impl SourceFingerprint {
 
     pub(crate) fn check_path(path: &Path, cached: Option<&Self>) -> Option<FingerprintStatus> {
         Self::check_path_with_related(path, std::iter::empty(), cached)
+    }
+
+    pub(crate) fn check_codex_path(
+        path: &Path,
+        cached: Option<&Self>,
+    ) -> Option<FingerprintStatus> {
+        if !crate::sessions::utils::is_zst_path(path) {
+            return Self::check_path(path, cached);
+        }
+
+        if let Some(cached) = cached {
+            let expected = codex_archive_limit_fingerprint(path);
+            if cached.related_files.as_slice() == [expected]
+                && primary_fingerprint_matches(path, cached)?
+            {
+                return Some(FingerprintStatus::Unchanged);
+            }
+        }
+
+        Self::from_codex_path(path).map(FingerprintStatus::Changed)
     }
 
     /// Check a non-Codex source without rebuilding its write-only whole-file
@@ -829,6 +863,23 @@ impl SourceFingerprint {
             content_hash,
             related_files,
         })
+    }
+}
+
+const CODEX_ARCHIVE_LIMIT_FINGERPRINT_SUFFIX: &str = "tokscale-config:codex-max-decoded-bytes";
+
+fn codex_archive_limit_fingerprint(path: &Path) -> RelatedFileFingerprint {
+    // This is a virtual parser input, not a file probe. `size` is an existing
+    // exact u64 wire field, and the fixed suffix distinguishes it from genuine
+    // sidecars. Keeping the source path avoids persisting any additional path.
+    RelatedFileFingerprint {
+        suffix: CODEX_ARCHIVE_LIMIT_FINGERPRINT_SUFFIX.to_string(),
+        path: CachedPath::from_path(path),
+        exists: false,
+        size: crate::sessions::codex::max_codex_archive_bytes(),
+        modified_ns: 0,
+        sample_hashes: Vec::new(),
+        content_hash: [0; 32],
     }
 }
 
@@ -1359,38 +1410,6 @@ fn shared_family_version(client: ClientId) -> Option<u32> {
     first.map(|(_, version)| version)
 }
 
-const CODEX_PARSER_BASE_VERSION: u32 = 18;
-
-pub(crate) fn codex_parser_version_for_limit(limit: u64) -> u32 {
-    if limit == crate::sessions::codex::MAX_CODEX_ARCHIVE_BYTES {
-        CODEX_PARSER_BASE_VERSION
-    } else {
-        // Fold the configured byte limit into the parser version so changing
-        // TOKSCALE_CODEX_MAX_DECODED_BYTES invalidates cached Codex entries.
-        const FNV_OFFSET_BASIS_32: u32 = 0x811c_9dc5;
-        const FNV_PRIME_32: u32 = 0x0100_0193;
-
-        let mut acc = FNV_OFFSET_BASIS_32;
-        for byte in CODEX_PARSER_BASE_VERSION.to_le_bytes() {
-            acc ^= u32::from(byte);
-            acc = acc.wrapping_mul(FNV_PRIME_32);
-        }
-        for byte in limit.to_le_bytes() {
-            acc ^= u32::from(byte);
-            acc = acc.wrapping_mul(FNV_PRIME_32);
-        }
-        if acc == 0 || acc == CODEX_PARSER_BASE_VERSION {
-            CODEX_PARSER_BASE_VERSION.wrapping_add(1)
-        } else {
-            acc
-        }
-    }
-}
-
-fn codex_parser_version() -> u32 {
-    codex_parser_version_for_limit(crate::sessions::codex::max_codex_archive_bytes())
-}
-
 fn parser_version(client: ClientId) -> u32 {
     // Shared-family members are versioned by the roster alone: their
     // version is their family's base plus their declared offset, so a
@@ -1475,9 +1494,7 @@ fn parser_version(client: ClientId) -> u32 {
         // v17->v18: settle pending token_usage_record rows when turn_aborted or
         // task_complete ends their turn. Completed v17 rollouts keep the same
         // fingerprint, so their undercounted entries must be reparsed.
-        // Changing TOKSCALE_CODEX_MAX_DECODED_BYTES folds the active limit into
-        // this version so rollouts cached under a larger limit reparse when capped.
-        ClientId::Codex => codex_parser_version(),
+        ClientId::Codex => 18,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -4929,12 +4946,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_codex_parser_version_invalidates_v11_entries() {
-        let mut env =
-            crate::paths::test_env::EnvGuard::capture(&["TOKSCALE_CODEX_MAX_DECODED_BYTES"]);
-        env.remove("TOKSCALE_CODEX_MAX_DECODED_BYTES");
-
         // v6->v7 splits `reasoning_output_tokens` out of the Codex output
         // bucket, v7->v8 retags rollouts OpenClaw originated as openclaw, and
         // v8->v9 buckets agent attribution into "Codex" / "Codex Subagent" /
@@ -4949,22 +4961,6 @@ mod tests {
         // settles pending usage when terminal events end a turn.
         // Each bump is what stops an existing cache from replaying the old
         // rows, so it has to be asserted rather than assumed.
-        assert_eq!(parser_version(ClientId::Codex), 18);
-        assert_eq!(
-            codex_parser_version_for_limit(crate::sessions::codex::MAX_CODEX_ARCHIVE_BYTES),
-            18
-        );
-        let capped_version = codex_parser_version_for_limit(64);
-        assert_ne!(capped_version, 18);
-        assert_ne!(capped_version, 0);
-        let another_capped_version = codex_parser_version_for_limit(1024);
-        assert_ne!(another_capped_version, capped_version);
-        assert_ne!(another_capped_version, 18);
-
-        env.set("TOKSCALE_CODEX_MAX_DECODED_BYTES", "64");
-        assert_eq!(parser_version(ClientId::Codex), capped_version);
-
-        env.remove("TOKSCALE_CODEX_MAX_DECODED_BYTES");
         assert_eq!(parser_version(ClientId::Codex), 18);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }

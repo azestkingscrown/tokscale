@@ -7439,3 +7439,71 @@ fn test_codex_compressed_session_respects_max_decoded_bytes_env() {
     let recapped_json: serde_json::Value = serde_json::from_slice(&recapped_output.stdout).unwrap();
     assert_eq!(recapped_json["totalMessages"].as_i64().unwrap(), 0);
 }
+
+#[test]
+fn test_codex_archive_limit_cache_identity_uses_exact_ceiling() {
+    use std::io::Write as _;
+
+    // These two accepted ceilings collide under the former 32-bit FNV cache
+    // version. Keep the decoded fixture between them so a warm hit admitted by
+    // the higher ceiling must be rejected after switching to the lower one.
+    const LOWER_LIMIT: u64 = 61_378_655;
+    const HIGHER_LIMIT: u64 = 71_067_507;
+    const PADDING_RECORDS: usize = 62;
+
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let compressed_file = sessions.join("collision-fixture.jsonl.zst");
+    let turn_context =
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#;
+    let padding_record = format!(
+        r#"{{"timestamp":"2026-10-01T00:00:01Z","type":"response_item","payload":{{"type":"function_call_output","output":"{}"}}}}"#,
+        "x".repeat(1_000_000)
+    );
+    let usage = r#"{"timestamp":"2026-10-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#;
+    let decoded_size =
+        turn_context.len() + 1 + PADDING_RECORDS * (padding_record.len() + 1) + usage.len() + 1;
+    assert!((decoded_size as u64) > LOWER_LIMIT);
+    assert!((decoded_size as u64) < HIGHER_LIMIT);
+
+    let mut encoder =
+        zstd::stream::write::Encoder::new(fs::File::create(&compressed_file).unwrap(), 0).unwrap();
+    writeln!(encoder, "{turn_context}").unwrap();
+    for _ in 0..PADDING_RECORDS {
+        writeln!(encoder, "{padding_record}").unwrap();
+    }
+    writeln!(encoder, "{usage}").unwrap();
+    encoder.finish().unwrap();
+
+    let admitted = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", HIGHER_LIMIT.to_string())
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        admitted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+    let admitted_json: serde_json::Value = serde_json::from_slice(&admitted.stdout).unwrap();
+    assert_eq!(admitted_json["totalMessages"].as_i64().unwrap(), 1);
+
+    let rejected = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", LOWER_LIMIT.to_string())
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        rejected.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let rejected_stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        rejected_stderr.contains("1 exceeded the 61378655-byte decoded-size limit"),
+        "stderr: {rejected_stderr}"
+    );
+    let rejected_json: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(rejected_json["totalMessages"].as_i64().unwrap(), 0);
+}

@@ -722,7 +722,7 @@ pub(crate) fn parse_max_codex_archive_bytes(raw: Option<&str>) -> u64 {
         .unwrap_or(MAX_CODEX_ARCHIVE_BYTES)
 }
 
-pub(crate) fn max_codex_archive_bytes() -> u64 {
+pub fn max_codex_archive_bytes() -> u64 {
     parse_max_codex_archive_bytes(
         std::env::var("TOKSCALE_CODEX_MAX_DECODED_BYTES")
             .ok()
