@@ -2,7 +2,6 @@ use anyhow::Result;
 use chrono::{Local, TimeZone};
 use colored::Colorize;
 use std::collections::HashMap;
-use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use unicode_normalization::UnicodeNormalization;
 
@@ -14,8 +13,8 @@ use tokscale_core::content_extractor::{extract_session_content, metadata_only_co
 use tokscale_core::pricing::PricingService;
 use tokscale_core::wiki::{WikiDb, WikiEntry};
 use tokscale_core::{
-    calculate_cost_with_service_tier_and_calls, parse_local_clients, CostSource, LocalParseOptions,
-    ParsedMessage, TokenBreakdown,
+    calculate_cost_with_service_tier, calculate_cost_with_service_tier_for_multi_call_aggregate,
+    parse_local_clients, CostSource, LocalParseOptions, ParsedMessage, TokenBreakdown,
 };
 
 pub struct ReportOptions {
@@ -35,7 +34,16 @@ pub struct ReportOptions {
     pub full: bool,
 }
 
+fn should_auto_sync_amp_for_report(home_dir: &Option<String>, client: &Option<String>) -> bool {
+    home_dir.is_none() && client.as_deref().is_none_or(|client| client == "amp")
+}
+
 pub fn run_report(opts: ReportOptions) -> Result<()> {
+    if should_auto_sync_amp_for_report(&opts.home_dir, &opts.client) {
+        if let Some(warning) = crate::amp::auto_sync() {
+            eprintln!("{warning}");
+        }
+    }
     let wiki_path = WikiDb::default_path();
     let db =
         WikiDb::open(&wiki_path).map_err(|e| anyhow::anyhow!("Failed to open wiki DB: {}", e))?;
@@ -126,9 +134,11 @@ fn populate_wiki_from_sessions(db: &WikiDb, opts: &ReportOptions) -> Result<()> 
     record_new_sessions(db, &parsed.messages, pricing.as_deref())
 }
 
-/// Aggregate `messages` per session and record every session the wiki has not
-/// seen yet. Recorded sessions are never rewritten, so the figures computed
-/// here are the ones the wiki keeps.
+/// Aggregate `messages` per session and refresh the wiki's accounting fields.
+///
+/// `WikiDb::upsert_entry` preserves existing summaries while replacing token,
+/// cost, model, and message totals. This lets parser-generation changes repair
+/// previously recorded sessions instead of leaving stale accounting forever.
 fn record_new_sessions(
     db: &WikiDb,
     messages: &[ParsedMessage],
@@ -167,23 +177,20 @@ fn record_new_sessions(
         agg.total_cost += compute_msg_cost(msg, pricing);
         // NOTE: the wiki `report` view intentionally groups on the raw model_id
         // and does not apply `modelAliases` folding (nor the grouping
-        // normalization every other report uses). Wiki entries are persisted
-        // append-only — previously-recorded sessions are not rewritten (see the
-        // `existing.contains` skip below) — so folding here would leave a mix of
-        // raw and canonical names across sessions recorded before vs after
-        // aliases were configured. To fold in a future change, wrap the key with
+        // normalization every other report uses). Wiki accounting is refreshed
+        // from source, but stored rows created by older releases can still carry
+        // raw model names until their source is scanned again. To fold in a
+        // future change, wrap the key with
         // `tokscale_core::normalize_model_for_grouping(&msg.model_id)` here and in
         // the by-model/daily/session/JSON surfaces.
-        *agg.models.entry(msg.model_id.clone()).or_insert(0) += 1;
-        agg.message_count += msg.message_count;
+        let model_count = agg.models.entry(msg.model_id.clone()).or_insert(0);
+        *model_count = model_count.saturating_add(1);
+        agg.message_count = agg.message_count.saturating_add(msg.message_count.max(0));
     }
 
     let mut new_count = 0;
     for (session_id, agg) in &session_map {
-        if existing.contains(session_id) {
-            continue;
-        }
-
+        let is_new = !existing.contains(session_id);
         let models_used: Vec<String> = agg.models.keys().cloned().collect();
         let duration_minutes = (agg.last_active - agg.created_at) / 60;
 
@@ -212,7 +219,9 @@ fn record_new_sessions(
 
         db.upsert_entry(&entry)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        new_count += 1;
+        if is_new {
+            new_count += 1;
+        }
     }
 
     if new_count > 0 {
@@ -1037,87 +1046,153 @@ fn run_minimax_summarizer(payloads: &[serde_json::Value]) -> Result<Vec<serde_js
 /// `tokscale report` can never block forever.
 const BACKEND_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Spawn `cmd`, optionally write `stdin_bytes` to its stdin, and wait up to
-/// `timeout` for it to finish.
-///
-/// Mirrors the pure-std spawn + reader-thread + `try_wait()` deadline + kill
-/// approach used by `run_capture_command` in `main.rs` (no extra dependency).
-/// Both stdout and stderr are drained on dedicated threads so a chatty backend
-/// cannot deadlock on a full pipe buffer while we poll for exit.
-///
-/// On timeout the child is killed and an `io::Error` of kind `TimedOut` is
-/// returned, which callers treat as a recoverable "skip this backend" signal.
-fn run_command_with_timeout(
-    mut cmd: Command,
-    timeout: Duration,
-    stdin_bytes: Option<&[u8]>,
-) -> std::io::Result<Output> {
-    use std::io::Read;
-    use std::thread;
-    use std::time::Instant;
+const MAX_CAPTURED_SUBPROCESS_BYTES: usize = 16 * 1024 * 1024;
 
+async fn drain_subprocess_pipe(
+    mut pipe: impl tokio::io::AsyncRead + Unpin,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = pipe.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(output);
+        }
+        if output.len().saturating_add(read) > MAX_CAPTURED_SUBPROCESS_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("subprocess output exceeded {MAX_CAPTURED_SUBPROCESS_BYTES} byte limit"),
+            ));
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
+}
+
+async fn terminate_and_reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+async fn run_command_async(
+    mut cmd: Command,
+    stdin_bytes: Option<Vec<u8>>,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    use tokio::io::AsyncWriteExt;
+
+    let deadline = tokio::time::Instant::now() + timeout;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin_bytes.is_some() {
         cmd.stdin(Stdio::piped());
     }
-
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.kill_on_drop(true);
     let mut child = cmd.spawn()?;
-
-    // Write to stdin (if requested) before draining output, then drop the
-    // handle so the child sees EOF.
     if let Some(bytes) = stdin_bytes {
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(bytes)?;
+            match tokio::time::timeout_at(deadline, stdin.write_all(&bytes)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    terminate_and_reap(&mut child).await;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "subprocess stdin write timed out",
+                    ));
+                }
+            }
         }
     }
-
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("failed to capture subprocess stdout"))?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| std::io::Error::other("failed to capture subprocess stderr"))?;
+    let mut stdout_drain = Box::pin(drain_subprocess_pipe(stdout));
+    let mut stderr_drain = Box::pin(drain_subprocess_pipe(stderr));
+    let mut status = None;
+    let mut stdout = None;
+    let mut stderr = None;
 
-    let stdout_handle = thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        stdout.read_to_end(&mut buf)?;
-        Ok(buf)
-    });
-    let stderr_handle = thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        stderr.read_to_end(&mut buf)?;
-        Ok(buf)
-    });
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+    loop {
+        tokio::select! {
+            result = child.wait(), if status.is_none() => {
+                match result {
+                    Ok(value) => status = Some(value),
+                    Err(error) => {
+                        terminate_and_reap(&mut child).await;
+                        return Err(error);
+                    }
+                }
+            }
+            result = &mut stdout_drain, if stdout.is_none() => {
+                match result {
+                    Ok(value) => stdout = Some(value),
+                    Err(error) => {
+                        terminate_and_reap(&mut child).await;
+                        return Err(error);
+                    }
+                }
+            }
+            result = &mut stderr_drain, if stderr.is_none() => {
+                match result {
+                    Ok(value) => stderr = Some(value),
+                    Err(error) => {
+                        terminate_and_reap(&mut child).await;
+                        return Err(error);
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                if status.is_none() {
+                    terminate_and_reap(&mut child).await;
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "subprocess or output drain timed out",
+                ));
+            }
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "summarizer backend timed out",
-            ));
+
+        if let (Some(status), Some(stdout), Some(stderr)) = (&status, &stdout, &stderr) {
+            return Ok(Output {
+                status: *status,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            });
         }
-        thread::sleep(Duration::from_millis(25));
-    };
+    }
+}
 
-    let stdout = stdout_handle
-        .join()
-        .map_err(|_| std::io::Error::other("subprocess stdout reader thread panicked"))??;
-    let stderr = stderr_handle
-        .join()
-        .map_err(|_| std::io::Error::other("subprocess stderr reader thread panicked"))??;
-
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
+/// Spawn `cmd`, optionally write `stdin_bytes` to its stdin, and wait up to
+/// `timeout` for the direct child and both bounded output drains to finish.
+///
+/// The async drains are owned by the invocation. Timing out drops and closes
+/// them before the dedicated runtime thread returns, so a descendant retaining
+/// a pipe cannot leak a blocked reader across repeated commands.
+///
+/// On timeout the child is killed and an `io::Error` of kind `TimedOut` is
+/// returned, which callers treat as a recoverable "skip this backend" signal.
+pub(crate) fn run_command_with_timeout(
+    cmd: Command,
+    timeout: Duration,
+    stdin_bytes: Option<&[u8]>,
+) -> std::io::Result<Output> {
+    let stdin_bytes = stdin_bytes.map(<[u8]>::to_vec);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(run_command_async(cmd, stdin_bytes, timeout))
+            })
+            .join()
+            .map_err(|_| std::io::Error::other("subprocess runtime thread panicked"))?
     })
 }
 
@@ -1576,26 +1651,31 @@ fn compute_msg_cost(msg: &ParsedMessage, pricing: Option<&PricingService>) -> f6
     let Some(pricing) = pricing else {
         return 0.0;
     };
-    let calls = if msg.client == "droid" {
-        1
-    } else {
-        msg.message_count.max(1) as usize
+    let tokens = TokenBreakdown {
+        input: msg.input,
+        output: msg.output,
+        cache_read: msg.cache_read,
+        cache_write: msg.cache_write,
+        cache_write_1h: msg.cache_write_1h,
+        reasoning: msg.reasoning,
     };
-    calculate_cost_with_service_tier_and_calls(
-        pricing,
-        &msg.model_id,
-        Some(&msg.provider_id),
-        &TokenBreakdown {
-            input: msg.input,
-            output: msg.output,
-            cache_read: msg.cache_read,
-            cache_write: msg.cache_write,
-            cache_write_1h: msg.cache_write_1h,
-            reasoning: msg.reasoning,
-        },
-        msg.service_tier.as_deref(),
-        calls,
-    )
+    if msg.client == "grok" && msg.message_count > 1 {
+        calculate_cost_with_service_tier_for_multi_call_aggregate(
+            pricing,
+            &msg.model_id,
+            Some(&msg.provider_id),
+            &tokens,
+            msg.service_tier.as_deref(),
+        )
+    } else {
+        calculate_cost_with_service_tier(
+            pricing,
+            &msg.model_id,
+            Some(&msg.provider_id),
+            &tokens,
+            msg.service_tier.as_deref(),
+        )
+    }
 }
 
 fn format_tokens(tokens: i64) -> String {
@@ -1646,6 +1726,18 @@ mod tests {
                 input_cost_per_token: Some(0.0001),
                 output_cost_per_token: Some(0.0002),
                 cache_read_input_token_cost: Some(0.00001),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "xai/grok-4.5".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000002),
+                input_cost_per_token_above_200k_tokens: Some(0.000004),
+                output_cost_per_token: Some(0.000006),
+                output_cost_per_token_above_200k_tokens: Some(0.000012),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_read_input_token_cost_above_200k_tokens: Some(0.000001),
                 ..Default::default()
             },
         );
@@ -1703,6 +1795,30 @@ mod tests {
             canonical > 0.0,
             "expected a positive cost for a known model"
         );
+    }
+
+    #[test]
+    fn compute_msg_cost_skips_xai_request_tier_for_grok_multi_call_aggregate() {
+        let pricing = test_pricing_service();
+        let mut aggregate = parsed_message("grok-4.5");
+        aggregate.client = "grok".to_string();
+        aggregate.provider_id = "xai".to_string();
+        aggregate.input = 58_682;
+        aggregate.output = 3_877;
+        aggregate.cache_read = 314_112;
+        aggregate.reasoning = 4_144;
+        aggregate.message_count = 8;
+
+        let aggregate_cost = compute_msg_cost(&aggregate, Some(&pricing));
+        let expected_base =
+            58_682.0 * 0.000002 + (3_877.0 + 4_144.0) * 0.000006 + 314_112.0 * 0.0000005;
+        assert!((aggregate_cost - expected_base).abs() < 1e-12);
+
+        aggregate.message_count = 1;
+        let single_request_cost = compute_msg_cost(&aggregate, Some(&pricing));
+        let expected_high =
+            58_682.0 * 0.000004 + (3_877.0 + 4_144.0) * 0.000012 + 314_112.0 * 0.000001;
+        assert!((single_request_cost - expected_high).abs() < 1e-12);
     }
 
     #[test]
@@ -1889,9 +2005,8 @@ mod tests {
     fn wiki_keeps_the_reported_cost_of_a_token_free_fx_session() {
         // fx can snapshot a session with a positive `total_cost`, no per-model
         // entries and zero tokens; the parser attributes it to `fx-unknown`
-        // with the reported cost. Pricing that row from its tokens yields $0,
-        // and the wiki never rewrites a session it has already recorded, so
-        // the wrong figure would stick for good.
+        // with the reported cost. Pricing that row from its tokens would record
+        // $0.00 instead.
         let home = tempfile::TempDir::new().unwrap();
         let session = home.path().join(".fx/sessions/sess-1");
         std::fs::create_dir_all(&session).unwrap();
@@ -1942,6 +2057,38 @@ mod tests {
             "wiki must keep the provider-reported cost, got {}",
             entry.total_cost
         );
+    }
+
+    #[test]
+    fn wiki_refreshes_accounting_while_preserving_summary() {
+        let home = tempfile::TempDir::new().unwrap();
+        let db = WikiDb::open(&home.path().join("wiki.db")).unwrap();
+        let mut stored = titled_entry("s1", "Keep this summary");
+        stored.total_input_tokens = 1;
+        stored.total_cost = 0.01;
+        stored.message_count = 1;
+        db.upsert_entry(&stored).unwrap();
+
+        let mut message = parsed_message("grok-4.5");
+        message.client = "grok".to_string();
+        message.provider_id = "xai".to_string();
+        message.input = 100;
+        message.output = 20;
+        message.cache_read = 30;
+        message.message_count = 8;
+        message.cost = 1.2345;
+        message.cost_source = CostSource::ProviderReported;
+
+        record_new_sessions(&db, &[message], None).unwrap();
+
+        let refreshed = db.get_entry("s1").unwrap().unwrap();
+        assert_eq!(refreshed.title.as_deref(), Some("Keep this summary"));
+        assert_eq!(refreshed.total_input_tokens, 100);
+        assert_eq!(refreshed.total_output_tokens, 20);
+        assert_eq!(refreshed.total_cache_read, 30);
+        assert!((refreshed.total_cost - 1.2345).abs() < 1e-9);
+        assert_eq!(refreshed.message_count, 8);
+        assert_eq!(refreshed.models_used, vec!["grok-4.5".to_string()]);
     }
 
     fn titled_entry(session_id: &str, title: &str) -> WikiEntry {
@@ -2452,5 +2599,67 @@ mod tests {
     fn parse_openai_content_returns_none_without_choices() {
         assert_eq!(parse_openai_content(r#"{"error":"nope"}"#), None);
         assert_eq!(parse_openai_content("not json"), None);
+    }
+
+    #[test]
+    fn bounded_subprocess_drain_rejects_oversized_output() {
+        let bytes = vec![0_u8; MAX_CAPTURED_SUBPROCESS_BYTES + 1];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(drain_subprocess_pipe(&bytes[..]))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_timeout_kills_and_reaps_the_direct_child() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let pid_path = temp.path().join("pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!("echo $$ > {}; exec sleep 30", pid_path.display()),
+        ]);
+
+        let error =
+            run_command_with_timeout(command, Duration::from_millis(200), None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let pid = std::fs::read_to_string(pid_path).unwrap();
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "timed-out direct child {pid} still exists");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_capture_cancels_descendant_owned_output_drains() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "(sleep 2) & printf done"]);
+
+        let error =
+            run_command_with_timeout(command, Duration::from_millis(200), None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn report_amp_auto_sync_respects_client_filter_and_home_isolation() {
+        assert!(should_auto_sync_amp_for_report(&None, &None));
+        assert!(should_auto_sync_amp_for_report(&None, &Some("amp".into())));
+        assert!(!should_auto_sync_amp_for_report(
+            &None,
+            &Some("codex".into())
+        ));
+        assert!(!should_auto_sync_amp_for_report(
+            &Some("/tmp/profile".into()),
+            &Some("amp".into())
+        ));
     }
 }

@@ -180,6 +180,13 @@ struct GrokUsage {
 
 impl GrokUsage {
     fn from_update(value: &Value) -> Option<Self> {
+        if let Some(update_kind) =
+            get_path(value, &["params", "update", "sessionUpdate"]).and_then(Value::as_str)
+        {
+            if update_kind != "turn_completed" {
+                return None;
+            }
+        }
         let usage = get_path(value, &["params", "update", "usage"])?;
         let raw_input = usage_value(usage, &["inputTokens", "input_tokens", "promptTokens"]);
         let raw_output = usage_value(
@@ -220,8 +227,11 @@ impl GrokUsage {
             && cache_read == 0
             && cache_write == 0
             && reasoning == 0
-            && cost_usd_ticks.unwrap_or(0) <= 0
         {
+            // A cost-only completion cannot replace the token-bearing fallback
+            // row: emitting it here would make the reconciliation below discard
+            // those tokens. Keep the fallback rather than report a zero-token
+            // authoritative bill that silently undercounts usage.
             return None;
         }
 
@@ -263,7 +273,7 @@ impl GrokUsage {
 fn extract_ticks_i64(value: Option<&Value>) -> Option<i64> {
     value.and_then(|val| {
         val.as_i64()
-            .or_else(|| val.as_u64().map(|v| v as i64))
+            .or_else(|| val.as_u64().and_then(|v| i64::try_from(v).ok()))
             .or_else(|| {
                 val.as_f64()
                     .filter(|f| f.is_finite() && *f >= 0.0)
@@ -276,7 +286,20 @@ fn extract_ticks_i64(value: Option<&Value>) -> Option<i64> {
 fn usage_keys_opt_ticks(value: &Value, keys: &[&str]) -> Option<i64> {
     keys.iter()
         .find_map(|key| extract_ticks_i64(value.get(*key)))
-        .filter(|&val| val >= 0)
+        // Current Grok Build omits zero, missing, and scrubbed costs. Treat an
+        // explicit zero from older or malformed records as unknown too.
+        .filter(|&val| val > 0)
+}
+
+fn usage_has_untrustworthy_cost(value: &Value) -> bool {
+    [
+        "costIsPartial",
+        "cost_is_partial",
+        "usageIsIncomplete",
+        "usage_is_incomplete",
+    ]
+    .iter()
+    .any(|key| value.get(*key).and_then(Value::as_bool) == Some(true))
 }
 
 fn extract_cost_usd_ticks(usage: &Value, update: Option<&Value>) -> Option<i64> {
@@ -287,50 +310,93 @@ fn extract_cost_usd_ticks(usage: &Value, update: Option<&Value>) -> Option<i64> 
         "cost_in_usd_ticks",
     ];
 
+    // Grok Build's wire contract says costs are authoritative only when the
+    // usage is complete and the bill is not partial. Fail closed for historical
+    // records that still carry ticks beside either flag.
+    if usage_has_untrustworthy_cost(usage) || update.is_some_and(usage_has_untrustworthy_cost) {
+        return None;
+    }
+
     if let Some(ticks) = usage_keys_opt_ticks(usage, TICK_KEYS) {
         return Some(ticks);
     }
 
     if let Some(models) = usage.get("modelUsage").and_then(Value::as_object) {
-        let mut total_ticks = 0i64;
-        let mut found = false;
-        for model_entry in models.values() {
-            if let Some(ticks) = usage_keys_opt_ticks(model_entry, TICK_KEYS) {
-                total_ticks = total_ticks.saturating_add(ticks);
-                found = true;
+        if !models.is_empty() {
+            if models.values().any(usage_has_untrustworthy_cost) {
+                return None;
             }
-        }
-        if found {
-            return Some(total_ticks);
-        }
-    }
-
-    if let Some(update) = update {
-        if let Some(ticks) = usage_keys_opt_ticks(update, TICK_KEYS) {
-            return Some(ticks);
+            // A partial sum is not the turn's bill. Accept the per-model fallback
+            // only when every model row carries a trustworthy cost.
+            let total_ticks = models.values().try_fold(0i64, |total, model_entry| {
+                usage_keys_opt_ticks(model_entry, TICK_KEYS)
+                    .and_then(|ticks| total.checked_add(ticks))
+            });
+            return total_ticks;
         }
     }
 
-    None
+    update.and_then(|update| usage_keys_opt_ticks(update, TICK_KEYS))
 }
 
 fn extract_model_calls(usage: &Value) -> i64 {
-    let direct = usage_value(usage, &["modelCalls", "model_calls", "modelCallCount"]);
-    if direct > 0 {
+    const CALL_KEYS: &[&str] = &["modelCalls", "model_calls", "modelCallCount"];
+    let direct = CALL_KEYS
+        .iter()
+        .find_map(|key| extract_i64(usage.get(*key)))
+        .filter(|calls| *calls > 0);
+    if let Some(direct) = direct {
         return direct;
     }
 
     if let Some(models) = usage.get("modelUsage").and_then(Value::as_object) {
-        let sum: i64 = models
-            .values()
-            .map(|entry| usage_value(entry, &["modelCalls", "model_calls", "modelCallCount"]))
-            .fold(0i64, |total, calls| total.saturating_add(calls));
-        if sum > 0 {
-            return sum;
+        if !models.is_empty() {
+            // Like cost, a partial sum is not the aggregate's call count. Require
+            // every model row and reject overflow instead of saturating to a large
+            // value that would distort pricing and displayed request totals.
+            let sum = models.values().try_fold(0i64, |total, entry| {
+                CALL_KEYS
+                    .iter()
+                    .find_map(|key| extract_i64(entry.get(*key)))
+                    .filter(|calls| *calls > 0)
+                    .and_then(|calls| total.checked_add(calls))
+            });
+            if let Some(sum) = sum.filter(|sum| *sum > 0) {
+                return sum;
+            }
         }
     }
 
     1
+}
+
+fn extract_prompt_id(value: &Value) -> Option<String> {
+    [
+        &["params", "update", "promptId"][..],
+        &["params", "update", "prompt_id"][..],
+        &["params", "_meta", "promptId"][..],
+        &["params", "_meta", "prompt_id"][..],
+    ]
+    .into_iter()
+    .find_map(|path| get_path(value, path).and_then(|value| extract_string(Some(value))))
+    .filter(|id| !id.trim().is_empty())
+}
+
+fn merge_usage_retransmission(existing: &mut UnifiedMessage, candidate: UnifiedMessage) {
+    let existing_has_cost = existing.has_authoritative_cost();
+    let existing_cost = existing.cost;
+    let candidate_has_cost = candidate.has_authoritative_cost();
+
+    if candidate.tokens.total() >= existing.tokens.total() {
+        *existing = candidate;
+        if existing_has_cost && !candidate_has_cost {
+            existing.cost = existing_cost;
+            existing.mark_provider_reported_cost();
+        }
+    } else if candidate_has_cost && !existing_has_cost {
+        existing.cost = candidate.cost;
+        existing.mark_provider_reported_cost();
+    }
 }
 
 fn usage_value(value: &Value, keys: &[&str]) -> i64 {
@@ -440,6 +506,7 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut active_turn: Option<ActiveTurn> = None;
     let mut turn_index = 0usize;
     let mut usage_index = 0usize;
+    let mut usage_prompt_indices = HashMap::new();
 
     for line in lossy_lines(BufReader::new(file)) {
         if line.trim().is_empty() {
@@ -487,29 +554,29 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
                     .or_else(|| metadata.model_id.clone())
                     .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
             };
+            let prompt_id = extract_prompt_id(&value);
             let event_id = get_path(&value, &["params", "_meta", "eventId"])
                 .and_then(|value| extract_string(Some(value)))
                 .unwrap_or_else(|| format!("turn-{usage_index}"));
-            // `eventId` is not unique: Grok reuses it across usage records, so
-            // keying on it alone gave distinct turns byte-identical keys. The
-            // Grok lane in `lib.rs` does not collapse duplicate keys today —
-            // it only runs `prefer_unified_log_messages` — so this is not
-            // currently load-bearing, but a per-record-unique key is correct on
-            // its own merits and cheap insurance against any consumer that does
-            // key on it. The position of the record within the file
-            // disambiguates them and stays stable across re-parses of an
-            // unchanged file, which the on-disk message cache this key feeds
-            // requires. Note the key is only unique within one file; it is not
-            // a global identity.
+            // Newer Grok rows carry a durable prompt ID. It survives
+            // retransmission and lets a later, more complete turn replace an
+            // earlier snapshot. Older rows fall back to their file position:
+            // eventId is reused and is not a unique turn identity.
+            let dedup_key = prompt_id.as_ref().map_or_else(
+                || {
+                    format!(
+                        "grok:{}:usage:{usage_index}:{event_id}",
+                        metadata.session_id
+                    )
+                },
+                |prompt_id| format!("grok:{}:prompt:{prompt_id}", metadata.session_id),
+            );
             let mut message = message_from_tokens(
                 &metadata,
                 model_id,
                 timestamp,
                 usage.tokens,
-                format!(
-                    "grok:{}:usage:{usage_index}:{event_id}",
-                    metadata.session_id
-                ),
+                dedup_key,
                 true,
             );
             if usage.model_calls > 0 {
@@ -519,7 +586,16 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
                 message.cost = (ticks as f64) * 1e-10;
                 message.mark_provider_reported_cost();
             }
-            usage_messages.push(message);
+            if let Some(prompt_id) = prompt_id {
+                if let Some(index) = usage_prompt_indices.get(&prompt_id).copied() {
+                    merge_usage_retransmission(&mut usage_messages[index], message);
+                } else {
+                    usage_prompt_indices.insert(prompt_id, usage_messages.len());
+                    usage_messages.push(message);
+                }
+            } else {
+                usage_messages.push(message);
+            }
             usage_index = usage_index.saturating_add(1);
         }
 
@@ -850,7 +926,9 @@ fn parse_grok_unified_log_snapshot(
         );
         message.model_attribution_conflicted = model_attribution_conflicted;
         message.session_id = session_id;
-        message.message_count = i32::from(message.is_turn_start);
+        // Each unified-log row is one model request. User interaction turns
+        // remain tracked separately by `is_turn_start`.
+        message.message_count = 1;
         messages.push(message);
     }
 
@@ -973,6 +1051,90 @@ pub(crate) fn grok_related_paths(path: &Path) -> Vec<(String, PathBuf)> {
     related
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GrokAggregateCoverageKey {
+    session_id: String,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cache_write_1h: i64,
+    reasoning: i64,
+    calls: usize,
+}
+
+fn aggregate_coverage_key(
+    session_id: &str,
+    tokens: &TokenBreakdown,
+    calls: usize,
+) -> GrokAggregateCoverageKey {
+    GrokAggregateCoverageKey {
+        session_id: session_id.to_string(),
+        input: tokens.input,
+        output: tokens.output,
+        cache_read: tokens.cache_read,
+        cache_write: tokens.cache_write,
+        cache_write_1h: tokens.cache_write_1h,
+        reasoning: tokens.reasoning,
+        calls,
+    }
+}
+
+fn add_token_breakdown(total: &mut TokenBreakdown, usage: &TokenBreakdown) {
+    total.input = total.input.saturating_add(usage.input);
+    total.output = total.output.saturating_add(usage.output);
+    total.cache_read = total.cache_read.saturating_add(usage.cache_read);
+    total.cache_write = total.cache_write.saturating_add(usage.cache_write);
+    total.cache_write_1h = total.cache_write_1h.saturating_add(usage.cache_write_1h);
+    total.reasoning = total.reasoning.saturating_add(usage.reasoning);
+}
+
+fn unified_turn_coverage(messages: &[UnifiedMessage]) -> HashMap<GrokAggregateCoverageKey, usize> {
+    let mut by_session: HashMap<&str, Vec<&UnifiedMessage>> = HashMap::new();
+    for message in messages
+        .iter()
+        .filter(|message| is_unified_log_message(message))
+    {
+        by_session
+            .entry(&message.session_id)
+            .or_default()
+            .push(message);
+    }
+
+    let mut coverage = HashMap::new();
+    for (session_id, mut session_messages) in by_session {
+        session_messages.sort_by_key(|message| message.timestamp);
+        let mut turn_tokens: Option<TokenBreakdown> = None;
+        let mut turn_calls = 0usize;
+
+        for message in session_messages {
+            if message.is_turn_start {
+                if let Some(tokens) = turn_tokens.take() {
+                    *coverage
+                        .entry(aggregate_coverage_key(session_id, &tokens, turn_calls))
+                        .or_insert(0) += 1;
+                }
+                turn_tokens = Some(TokenBreakdown::default());
+                turn_calls = 0;
+            }
+            let Some(tokens) = turn_tokens.as_mut() else {
+                // A clipped unified log can begin in the middle of a turn. It
+                // cannot prove coverage of a complete legacy aggregate.
+                continue;
+            };
+            add_token_breakdown(tokens, &message.tokens);
+            turn_calls = turn_calls.saturating_add(1);
+        }
+
+        if let Some(tokens) = turn_tokens {
+            *coverage
+                .entry(aggregate_coverage_key(session_id, &tokens, turn_calls))
+                .or_insert(0) += 1;
+        }
+    }
+    coverage
+}
+
 /// Uses the richer, per-inference unified log for sessions it covers. Legacy
 /// updates remain a fallback for sessions absent from that log, avoiding an
 /// additive merge of two representations of the same activity.
@@ -1044,10 +1206,11 @@ pub fn prefer_unified_log_messages(mut messages: Vec<UnifiedMessage>) -> Vec<Uni
         }
     }
 
-    // A unified row only proves that one legacy activity row is covered when
-    // both representations agree on the session, timestamp, and inclusive
-    // token total. Retain every unmatched legacy row so a partially migrated
-    // session cannot lose its older history.
+    // Exact per-row matches cover legacy single-call activity. For a legacy
+    // multi-call turn, a complete unified turn covers it only when every token
+    // bucket and the call count add back to the same aggregate. Retain every
+    // unmatched legacy row so a partially migrated session cannot lose history.
+    let mut covered_turn_aggregates = unified_turn_coverage(&messages);
     let mut covered_activity = HashMap::new();
     let mut covered_fallback_timestamps = HashMap::new();
     for message in messages
@@ -1073,21 +1236,14 @@ pub fn prefer_unified_log_messages(mut messages: Vec<UnifiedMessage>) -> Vec<Uni
             continue;
         }
 
-        let key = (
-            message.session_id.clone(),
-            message.timestamp,
-            message.tokens.total(),
+        let aggregate_key = aggregate_coverage_key(
+            &message.session_id,
+            &message.tokens,
+            message.message_count.max(0) as usize,
         );
-        let covered = covered_activity.get_mut(&key).is_some_and(|count| {
-            if *count == 0 {
-                false
-            } else {
-                *count -= 1;
-                true
-            }
-        }) || (is_legacy_fallback_message(&message)
-            && covered_fallback_timestamps
-                .get_mut(&(message.session_id.clone(), message.timestamp))
+        let aggregate_covered = message.message_count > 1
+            && covered_turn_aggregates
+                .get_mut(&aggregate_key)
                 .is_some_and(|count| {
                     if *count == 0 {
                         false
@@ -1095,7 +1251,32 @@ pub fn prefer_unified_log_messages(mut messages: Vec<UnifiedMessage>) -> Vec<Uni
                         *count -= 1;
                         true
                     }
-                }));
+                });
+        let key = (
+            message.session_id.clone(),
+            message.timestamp,
+            message.tokens.total(),
+        );
+        let covered = aggregate_covered
+            || covered_activity.get_mut(&key).is_some_and(|count| {
+                if *count == 0 {
+                    false
+                } else {
+                    *count -= 1;
+                    true
+                }
+            })
+            || (is_legacy_fallback_message(&message)
+                && covered_fallback_timestamps
+                    .get_mut(&(message.session_id.clone(), message.timestamp))
+                    .is_some_and(|count| {
+                        if *count == 0 {
+                            false
+                        } else {
+                            *count -= 1;
+                            true
+                        }
+                    }));
         if !covered {
             selected.push(message);
         }
@@ -1675,19 +1856,19 @@ mod tests {
         assert!(messages[0].is_turn_start);
         assert_eq!(messages[1].tokens.input, 80);
         assert_eq!(messages[1].tokens.output, 12);
-        assert_eq!(messages[1].message_count, 0);
+        assert_eq!(messages[1].message_count, 1);
         assert!(!messages[1].is_turn_start);
         assert_eq!(messages[2].tokens.input, 0);
         assert_eq!(messages[2].tokens.cache_read, 10);
         assert_eq!(messages[2].tokens.output, 1);
         assert_eq!(messages[2].tokens.total(), 11);
-        assert_eq!(messages[2].message_count, 0);
+        assert_eq!(messages[2].message_count, 1);
         assert!(!messages[2].is_turn_start);
         assert_eq!(messages[3].tokens.input, 10);
         assert_eq!(messages[3].tokens.output, 0);
         assert_eq!(messages[3].tokens.reasoning, 1);
         assert_eq!(messages[3].tokens.total(), 11);
-        assert_eq!(messages[3].message_count, 0);
+        assert_eq!(messages[3].message_count, 1);
         assert!(!messages[3].is_turn_start);
     }
 
@@ -1871,6 +2052,63 @@ mod tests {
         assert_eq!(messages[0].model_id, "grok-4.5");
         assert_eq!(messages[0].workspace_key.as_deref(), Some("/tmp/project"));
         assert_eq!(messages[0].workspace_label.as_deref(), Some("project"));
+    }
+
+    #[test]
+    fn selector_replaces_multi_call_aggregate_with_complete_unified_turn() {
+        let mut legacy = test_message("covered", "grok:covered:usage:turn");
+        legacy.timestamp = 1_700_000_003_000;
+        legacy.tokens = TokenBreakdown {
+            input: 300,
+            output: 30,
+            cache_read: 50,
+            reasoning: 10,
+            ..Default::default()
+        };
+        legacy.message_count = 2;
+        legacy.cost = 1.25;
+        legacy.mark_provider_reported_cost();
+
+        let mut first = test_message("covered", "grok-unified:covered:first");
+        first.timestamp = 1_700_000_001_000;
+        first.tokens = TokenBreakdown {
+            input: 100,
+            output: 10,
+            cache_read: 20,
+            reasoning: 4,
+            ..Default::default()
+        };
+        first.is_turn_start = true;
+
+        let mut second = test_message("covered", "grok-unified:covered:second");
+        second.timestamp = 1_700_000_002_000;
+        second.tokens = TokenBreakdown {
+            input: 200,
+            output: 20,
+            cache_read: 30,
+            reasoning: 6,
+            ..Default::default()
+        };
+
+        let messages = prefer_unified_log_messages(vec![legacy, first, second]);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(is_unified_log_message));
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message_count)
+                .sum::<i32>(),
+            2
+        );
+        let mut total = TokenBreakdown::default();
+        for message in &messages {
+            add_token_breakdown(&mut total, &message.tokens);
+        }
+        assert_eq!(total.input, 300);
+        assert_eq!(total.output, 30);
+        assert_eq!(total.cache_read, 50);
+        assert_eq!(total.reasoning, 10);
     }
 
     #[test]
@@ -2233,10 +2471,58 @@ mod tests {
     }
 
     #[test]
+    fn ignores_non_terminal_usage_snapshots() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"response_completed","usage":{"inputTokens":100,"outputTokens":20,"modelCalls":1,"costUsdTicks":10000000000}},"_meta":{"eventId":"response-1","agentTimestampMs":1790900000000}}}
+{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":100,"outputTokens":20,"modelCalls":1,"costUsdTicks":10000000000}},"_meta":{"eventId":"turn-1","agentTimestampMs":1790900001000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.total(), 120);
+        assert!((messages[0].cost - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prompt_id_retransmission_keeps_one_complete_usage_row() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","prompt_id":"prompt-1","usage":{"inputTokens":100,"outputTokens":20,"modelCalls":1}},"_meta":{"eventId":"shared","agentTimestampMs":1790900000000}}}
+{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","prompt_id":"prompt-1","usage":{"inputTokens":120,"outputTokens":30,"modelCalls":1,"costUsdTicks":10000000000}},"_meta":{"eventId":"shared","agentTimestampMs":1790900001000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.total(), 150);
+        assert!((messages[0].cost - 1.0).abs() < 1e-9);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("grok:session-1:prompt:prompt-1")
+        );
+    }
+
+    #[test]
+    fn reused_event_id_with_distinct_prompt_ids_keeps_both_turns() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","promptId":"prompt-1","usage":{"inputTokens":100,"outputTokens":20,"modelCalls":1}},"_meta":{"eventId":"shared","agentTimestampMs":1790900000000}}}
+{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","promptId":"prompt-2","usage":{"inputTokens":120,"outputTokens":30,"modelCalls":1}},"_meta":{"eventId":"shared","agentTimestampMs":1790900001000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 2);
+        assert_ne!(messages[0].dedup_key, messages[1].dedup_key);
+    }
+
+    #[test]
     fn parses_turn_completed_model_calls_and_cost_usd_ticks() {
         let (_temp, path) = write_fixture(
             r#"{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"agentTimestampMs":1790900000000}}}
-{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":372794,"outputTokens":8021,"totalTokens":380815,"cachedReadTokens":314112,"reasoningTokens":4144,"modelCalls":8,"costUsdTicks":964100000000,"modelUsage":{"grok-4.5":{"inputTokens":372794,"outputTokens":8021,"totalTokens":380815,"cachedReadTokens":314112,"reasoningTokens":4144,"modelCalls":8}}}},"_meta":{"eventId":"turn-1","agentTimestampMs":1790900001000}}}"#,
+{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":372794,"outputTokens":8021,"totalTokens":380815,"cachedReadTokens":314112,"reasoningTokens":4144,"modelCalls":8,"costUsdTicks":12345000000,"modelUsage":{"grok-4.5":{"inputTokens":372794,"outputTokens":8021,"totalTokens":380815,"cachedReadTokens":314112,"reasoningTokens":4144,"modelCalls":8}}}},"_meta":{"eventId":"turn-1","agentTimestampMs":1790900001000}}}"#,
             None,
             None,
         );
@@ -2247,7 +2533,7 @@ mod tests {
         assert_eq!(msg.model_id, "grok-4.5");
         assert_eq!(msg.message_count, 8);
         assert_eq!(msg.cost_source, CostSource::ProviderReported);
-        assert!((msg.cost - 96.41).abs() < 1e-9);
+        assert!((msg.cost - 1.2345).abs() < 1e-9);
         assert_eq!(msg.tokens.input, 58_682);
         assert_eq!(msg.tokens.cache_read, 314_112);
         assert_eq!(msg.tokens.output, 3_877);
@@ -2268,6 +2554,68 @@ mod tests {
         assert_eq!(msg.message_count, 5);
         assert_eq!(msg.cost_source, CostSource::ProviderReported);
         assert!((msg.cost - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_partial_or_incomplete_reported_costs() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":100,"outputTokens":20,"modelCalls":1,"costUsdTicks":10000000000,"costIsPartial":true}}},"_meta":{"eventId":"turn-partial","agentTimestampMs":1790900001000}}
+{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":200,"outputTokens":30,"modelCalls":1,"costUsdTicks":20000000000,"usageIsIncomplete":true}}},"_meta":{"eventId":"turn-incomplete","agentTimestampMs":1790900002000}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 2);
+        for message in messages {
+            assert_eq!(message.cost, 0.0);
+            assert_eq!(message.cost_source, CostSource::Unknown);
+        }
+    }
+
+    #[test]
+    fn rejects_partial_per_model_cost_sum() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":300,"outputTokens":30,"modelUsage":{"grok-4.5":{"inputTokens":100,"outputTokens":10,"modelCalls":1,"costUsdTicks":10000000000},"grok-4.6":{"inputTokens":200,"outputTokens":20,"modelCalls":1}}}}},"_meta":{"eventId":"turn-1","agentTimestampMs":1790900001000}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_count, 2);
+        assert_eq!(messages[0].cost, 0.0);
+        assert_eq!(messages[0].cost_source, CostSource::Unknown);
+    }
+
+    #[test]
+    fn does_not_use_partial_per_model_call_count() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":300,"outputTokens":30,"modelUsage":{"grok-4.5":{"inputTokens":100,"outputTokens":10,"modelCalls":2},"grok-4.6":{"inputTokens":200,"outputTokens":20}}}}},"_meta":{"eventId":"turn-1","agentTimestampMs":1790900001000}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_count, 1);
+    }
+
+    #[test]
+    fn cost_only_completion_does_not_replace_token_fallback() {
+        let (_temp, path) = write_fixture(
+            r#"{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"user_message_chunk"},"_meta":{"totalTokens":0,"agentTimestampMs":1790900000000}}}
+{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"agent_message_chunk"},"_meta":{"totalTokens":100,"agentTimestampMs":1790900001000}}}
+{"method":"session/update","params":{"sessionId":"probe-session","update":{"sessionUpdate":"turn_completed","usage":{"costUsdTicks":10000000000,"modelCalls":1}},"_meta":{"eventId":"turn-1","agentTimestampMs":1790900002000}}}"#,
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.total(), 100);
+        assert_eq!(messages[0].cost, 0.0);
+        assert_eq!(messages[0].cost_source, CostSource::Unknown);
     }
 
     #[test]
