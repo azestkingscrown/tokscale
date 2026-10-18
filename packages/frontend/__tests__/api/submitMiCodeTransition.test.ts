@@ -236,7 +236,7 @@ function installStore() {
     select(columns: Record<string, unknown>) {
       let predicate: SQL;
       const result = () => {
-        if ("date" in columns && "sourceBreakdown" in columns) {
+        if ("id" in columns && "date" in columns && "sourceBreakdown" in columns) {
           const query = decode(predicate);
           expect(query.sql).toContain('"daily_breakdown"."submitted_device_id"');
           const deviceId = query.params.find((value) => [...devices.values()].some((d) => d.id === value));
