@@ -341,26 +341,32 @@ export function evaluateSubmissionForWithholding(
   const contributionsModelTokens = new Map<string, number>();
   for (const day of contributions) {
     for (const client of day.clients ?? []) {
+      let nestedTokensSum = 0;
       if (client.models && Object.keys(client.models).length > 0) {
         for (const [modelId, mData] of Object.entries(client.models)) {
           const tokens =
             typeof mData === "number"
               ? toNumeric(mData)
               : Math.max(toNumeric(mData?.tokens), sumTokenBreakdown(mData));
+          nestedTokensSum += tokens;
           contributionsModelTokens.set(
             modelId,
             (contributionsModelTokens.get(modelId) ?? 0) + tokens
           );
         }
-      } else if (client.modelId) {
-        const tokens =
+      }
+      if (client.modelId) {
+        const scalarTokens =
           typeof client.tokens === "object" && client.tokens !== null
             ? sumTokenBreakdown(client.tokens)
             : toNumeric(client.tokens);
-        contributionsModelTokens.set(
-          client.modelId,
-          (contributionsModelTokens.get(client.modelId) ?? 0) + tokens
-        );
+        const remainderTokens = Math.max(0, scalarTokens - nestedTokensSum);
+        if (remainderTokens > 0 || !contributionsModelTokens.has(client.modelId)) {
+          contributionsModelTokens.set(
+            client.modelId,
+            (contributionsModelTokens.get(client.modelId) ?? 0) + remainderTokens
+          );
+        }
       }
     }
   }
@@ -422,36 +428,54 @@ export function evaluateSubmissionForWithholding(
 
   // 1. Physically impossible output tokens (> 10 Billion output tokens/day)
   // LLM inference output speeds have hard physical limits. Prompt cache read is unaffected.
+  const outputByDate = new Map<string, number>();
   for (const day of contributions) {
     const dayOutput = Math.max(
       toNumeric(day.tokenBreakdown?.output),
       sumClientsOutput(day.clients)
     );
+    const dateKey =
+      typeof day.date === "string" && day.date.trim() ? day.date.trim() : null;
+    const effectiveDayOutput = dateKey
+      ? (outputByDate.get(dateKey) ?? 0) + dayOutput
+      : dayOutput;
+    if (dateKey) {
+      outputByDate.set(dateKey, effectiveDayOutput);
+    }
 
-    if (dayOutput > WITHHOLDING_MAX_DAILY_OUTPUT_TOKENS) {
-      const dayLabel = day.date ? `on ${day.date}` : "in a single day";
+    if (effectiveDayOutput > WITHHOLDING_MAX_DAILY_OUTPUT_TOKENS) {
+      const dayLabel = dateKey ? `on ${dateKey}` : "in a single day";
       return {
         shouldWithhold: true,
         trigger: "impossible_output_tokens",
-        reason: `Physically impossible output tokens ${dayLabel}: ${dayOutput.toLocaleString("en-US")} output tokens exceeds daily ceiling of ${WITHHOLDING_MAX_DAILY_OUTPUT_TOKENS.toLocaleString("en-US")} tokens`,
+        reason: `Physically impossible output tokens ${dayLabel}: ${effectiveDayOutput.toLocaleString("en-US")} output tokens exceeds daily ceiling of ${WITHHOLDING_MAX_DAILY_OUTPUT_TOKENS.toLocaleString("en-US")} tokens`,
       };
     }
   }
 
   // 2. Extreme single-day volume ceiling (> 500 Billion tokens/day)
+  const totalByDate = new Map<string, number>();
   for (const day of contributions) {
     const dayTotal = Math.max(
       toNumeric(day.totals?.tokens),
       sumTokenBreakdown(day.tokenBreakdown),
       sumClientsTokens(day.clients)
     );
+    const dateKey =
+      typeof day.date === "string" && day.date.trim() ? day.date.trim() : null;
+    const effectiveDayTotal = dateKey
+      ? (totalByDate.get(dateKey) ?? 0) + dayTotal
+      : dayTotal;
+    if (dateKey) {
+      totalByDate.set(dateKey, effectiveDayTotal);
+    }
 
-    if (dayTotal > WITHHOLDING_MAX_DAILY_TOTAL_TOKENS) {
-      const dayLabel = day.date ? `on ${day.date}` : "in a single day";
+    if (effectiveDayTotal > WITHHOLDING_MAX_DAILY_TOTAL_TOKENS) {
+      const dayLabel = dateKey ? `on ${dateKey}` : "in a single day";
       return {
         shouldWithhold: true,
         trigger: "extreme_single_day_volume",
-        reason: `Extreme single-day volume ceiling exceeded ${dayLabel}: ${dayTotal.toLocaleString("en-US")} tokens exceeds daily volume ceiling of ${WITHHOLDING_MAX_DAILY_TOTAL_TOKENS.toLocaleString("en-US")} tokens`,
+        reason: `Extreme single-day volume ceiling exceeded ${dayLabel}: ${effectiveDayTotal.toLocaleString("en-US")} tokens exceeds daily volume ceiling of ${WITHHOLDING_MAX_DAILY_TOTAL_TOKENS.toLocaleString("en-US")} tokens`,
       };
     }
   }

@@ -1211,5 +1211,86 @@ describe("moderation withholding evaluation (Issue #1473)", () => {
       expect(isSubmissionWithheld({ totalTokens: 10_000, totalCost: 1 })).toBe(false);
       expect(isSubmissionWithheld({ totalTokens: 1_000_000, totalCost: 10_000 })).toBe(true);
     });
+
+    it("credits scalar token remainder to top-level modelId when client.models is partial or empty", () => {
+      const partialModelsPayload: WithholdingSubmissionInput = {
+        totalTokens: 1_200_000,
+        totalCost: 10,
+        contributions: [
+          {
+            date: "2026-04-30",
+            totals: { tokens: 1_200_000, cost: 10, messages: 20 },
+            clients: [
+              {
+                client: "claude",
+                modelId: "slop-model-v2",
+                tokens: 1_200_000,
+                cost: 10,
+                models: {
+                  "gpt-4o": { tokens: 2 },
+                },
+              },
+            ],
+          },
+        ],
+      };
+
+      const partialResult = evaluateSubmissionForWithholding(partialModelsPayload);
+      expect(partialResult.shouldWithhold).toBe(true);
+      expect(partialResult.trigger).toBe("slop_model_name");
+      expect(partialResult.reason).toContain('"slop-model-v2"');
+      expect(partialResult.reason).toContain("1,199,998 tokens");
+
+      const emptyModelsPayload: WithholdingSubmissionInput = {
+        totalTokens: 1_500_000,
+        totalCost: 5,
+        contributions: [
+          {
+            date: "2026-04-30",
+            totals: { tokens: 1_500_000, cost: 5, messages: 10 },
+            clients: [
+              {
+                client: "claude",
+                modelId: "fake-opus-model",
+                tokens: 1_500_000,
+                cost: 5,
+                models: {},
+              },
+            ],
+          },
+        ],
+      };
+
+      const emptyResult = evaluateSubmissionForWithholding(emptyModelsPayload);
+      expect(emptyResult.shouldWithhold).toBe(true);
+      expect(emptyResult.trigger).toBe("slop_model_name");
+      expect(emptyResult.reason).toContain('"fake-opus-model"');
+      expect(emptyResult.reason).toContain("1,500,000 tokens");
+    });
+
+    it("aggregates multiple contribution entries sharing the same calendar date when checking daily ceilings", () => {
+      const splitOutputPayload: WithholdingSubmissionInput = {
+        totalTokens: 12_000_000_000,
+        totalCost: 1200,
+        contributions: [
+          {
+            date: "2026-04-30",
+            totals: { tokens: 6_000_000_000, cost: 600 },
+            tokenBreakdown: { input: 0, output: 6_000_000_000 },
+          },
+          {
+            date: "2026-04-30",
+            totals: { tokens: 6_000_000_000, cost: 600 },
+            tokenBreakdown: { input: 0, output: 6_000_000_000 },
+          },
+        ],
+      };
+
+      const splitOutputResult = evaluateSubmissionForWithholding(splitOutputPayload);
+      expect(splitOutputResult.shouldWithhold).toBe(true);
+      expect(splitOutputResult.trigger).toBe("impossible_output_tokens");
+      expect(splitOutputResult.reason).toContain("on 2026-04-30");
+      expect(splitOutputResult.reason).toContain("12,000,000,000 output tokens");
+    });
   });
 });
