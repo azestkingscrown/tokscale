@@ -1604,10 +1604,12 @@ export async function POST(request: Request) {
                 }
               }
 
+              const rawDayDate =
+                (day as { dayDate?: unknown; date?: unknown }).dayDate ??
+                (day as { date?: unknown }).date;
               const dayDate =
-                typeof (day as { date?: unknown }).date === "string" &&
-                (day as { date: string }).date.trim()
-                  ? (day as { date: string }).date.trim()
+                typeof rawDayDate === "string" && rawDayDate.trim()
+                  ? rawDayDate.trim()
                   : undefined;
 
               if (dayDate) {
