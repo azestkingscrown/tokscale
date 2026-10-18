@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { PgDialect } from "drizzle-orm/pg-core";
+import type { SQL } from "drizzle-orm";
 import { getModerationCandidates } from "@/lib/moderation/candidates";
 import { applyModerationAction } from "@/lib/moderation/actions";
 import { db } from "@/lib/db";
+
+const dialect = new PgDialect();
 
 vi.mock("@/lib/db", () => {
   return {
@@ -51,7 +55,7 @@ describe("getModerationCandidates - moderation action metadata exposure", () => 
     vi.restoreAllMocks();
   });
 
-  it("exposes latestActorUsername, latestAction, and latestActionReason for system-withheld accounts", async () => {
+  it("exposes latestActorUsername, latestAction, and latestActionReason for system-withheld accounts and emits the latest_mod CTE query shape", async () => {
     const mockDbRow = {
       user_id: "user-1",
       username: "suspect_bot",
@@ -78,6 +82,20 @@ describe("getModerationCandidates - moderation action metadata exposure", () => 
     vi.mocked(db.execute).mockResolvedValueOnce([mockDbRow] as unknown as never);
 
     const candidates = await getModerationCandidates();
+
+    expect(db.execute).toHaveBeenCalledTimes(1);
+    const executedSql = dialect
+      .sqlToQuery(vi.mocked(db.execute).mock.calls[0][0] as unknown as SQL)
+      .sql.replace(/\s+/g, " ");
+    expect(executedSql).toContain(
+      "latest_mod AS ( SELECT DISTINCT ON (target_user_id) target_user_id, actor_username, action, reason FROM moderation_actions WHERE target_user_id IS NOT NULL ORDER BY target_user_id, created_at DESC, id DESC )"
+    );
+    expect(executedSql).toContain(
+      "LEFT JOIN latest_mod lm ON lm.target_user_id = p.user_id"
+    );
+    expect(executedSql).toContain("lm.actor_username AS latest_actor_username");
+    expect(executedSql).toContain("lm.action AS latest_action");
+    expect(executedSql).toContain("lm.reason AS latest_action_reason");
 
     expect(candidates).toHaveLength(1);
     const candidate = candidates[0];

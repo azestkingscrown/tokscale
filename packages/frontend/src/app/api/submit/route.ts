@@ -1773,6 +1773,7 @@ export async function POST(request: Request) {
           .select({ leaderboardHidden: users.leaderboardHidden })
           .from(users)
           .where(eq(users.id, tokenRecord.userId))
+          .for("update")
           .limit(1);
 
         if (!currentUser?.leaderboardHidden) {
@@ -1902,6 +1903,18 @@ export async function POST(request: Request) {
                   and(
                     eq(users.id, tokenRecord.userId),
                     eq(users.leaderboardHidden, false),
+                    sql`NOT EXISTS (
+                      SELECT 1 FROM (
+                        SELECT action, actor_username
+                        FROM ${moderationActions}
+                        WHERE ${moderationActions.targetUserId} = ${tokenRecord.userId}
+                        ORDER BY ${moderationActions.createdAt} DESC, ${moderationActions.id} DESC
+                        LIMIT 1
+                      ) AS latest_mod
+                      WHERE latest_mod.action = 'unhide'
+                        AND LENGTH(TRIM(COALESCE(latest_mod.actor_username, ''))) > 0
+                        AND LOWER(TRIM(latest_mod.actor_username)) <> 'system'
+                    )`,
                   ),
                 );
 
