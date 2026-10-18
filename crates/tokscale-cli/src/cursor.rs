@@ -2708,6 +2708,21 @@ pub async fn sync_cursor_cache_for_submit(explicit_timeout: Option<Duration>) ->
         .await
 }
 
+async fn sync_cursor_cache_for_submit_with_fetcher_in_home<F, Fut>(
+    home: &Path,
+    fetch_usage_json: F,
+) -> SyncCursorResult
+where
+    F: Fn(CursorUsageFetch) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    if !cursor_desktop_auto_import_is_disabled_in_home(home) {
+        let _ = ensure_credentials_from_local_cursor();
+    }
+
+    sync_cursor_cache_with_fetcher_in_home(home, fetch_usage_json).await
+}
+
 async fn sync_cursor_cache_for_submit_in_home<F>(
     home: &Path,
     explicit_timeout: Option<Duration>,
@@ -2716,13 +2731,9 @@ async fn sync_cursor_cache_for_submit_in_home<F>(
 where
     F: FnOnce() -> Option<u64>,
 {
-    if !cursor_desktop_auto_import_is_disabled_in_home(home) {
-        let _ = ensure_credentials_from_local_cursor();
-    }
-
     let configured_secs = setting_budget_for_submit(explicit_timeout, load_setting);
     let (timeout, is_custom) = sync_timeout_override_for_submit(explicit_timeout, configured_secs);
-    sync_cursor_cache_with_fetcher_in_home(home, move |fetch| async move {
+    sync_cursor_cache_for_submit_with_fetcher_in_home(home, move |fetch| async move {
         fetch_cursor_usage_events_json(
             &fetch.session_token,
             timeout,
@@ -3522,16 +3533,53 @@ mod tests {
         disable_cursor_desktop_auto_import_in_home(home)?;
         assert!(cursor_desktop_auto_import_is_disabled_in_home(home));
 
-        let rt = tokio::runtime::Runtime::new()?;
-        let _result = rt.block_on(sync_cursor_cache_for_submit_in_home(
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "desktop-account".to_string(),
+            CursorCredentials {
+                session_token: "test-token".to_string(),
+                user_id: Some("desktop-user".to_string()),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                expires_at: None,
+                label: None,
+            },
+        );
+        save_credentials_store_in_home(
             home,
-            Some(Duration::from_secs(30)),
-            || Some(60),
+            &CursorCredentialsStore {
+                version: 1,
+                active_account_id: "desktop-account".to_string(),
+                accounts,
+            },
+        )?;
+
+        let sample_usage = owned_cursor_cache(
+            r#"{"usageEventsDisplay":[{"conversationId":"c1","timestamp":"1000","model":"claude-3-7-sonnet","chargedCents":1}]}"#,
+            "desktop-account",
+        )?;
+
+        let rt = tokio::runtime::Runtime::new()?;
+        let result = rt.block_on(sync_cursor_cache_for_submit_with_fetcher_in_home(
+            home,
+            move |_fetch| {
+                let usage = sample_usage.clone();
+                async move { Ok(usage) }
+            },
         ));
 
         assert!(
+            result.synced,
+            "submit sync must succeed with seeded account: {:?}",
+            result.error
+        );
+        assert_eq!(result.rows, 1);
+        assert!(
             cursor_desktop_auto_import_is_disabled_in_home(home),
             "submit sync must never clear disabled desktop discovery"
+        );
+        assert!(
+            cursor_cache_dir(home).join("usage.json").is_file(),
+            "submit sync must write the usage cache"
         );
         Ok(())
     }
