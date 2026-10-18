@@ -257,11 +257,9 @@ function sumClientsTokens(clients?: WithholdingClientContribution[] | null): num
       }
     }
     const scalarTokens =
-      typeof client.tokens === "number"
-        ? toNumeric(client.tokens)
-        : typeof client.tokens === "object" && client.tokens !== null
+      typeof client.tokens === "object" && client.tokens !== null
         ? sumTokenBreakdown(client.tokens)
-        : 0;
+        : toNumeric(client.tokens);
     total += Math.max(clientModelsSum, scalarTokens);
   }
   return total;
