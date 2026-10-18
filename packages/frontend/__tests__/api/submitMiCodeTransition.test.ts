@@ -251,10 +251,12 @@ function installStore() {
         }
         if ("id" in columns && "sessionCount" in columns) return hasSubmission ? [{ id: "submission-one" }] : [];
         if ("sessionCount" in columns) return [{}];
+        if ("leaderboardHidden" in columns) return [{ leaderboardHidden: false }];
+        if ("action" in columns && "actorUsername" in columns) return [];
         throw new Error(`Unexpected select: ${Object.keys(columns)}`);
       };
       const builder = {
-        from: () => builder, for: () => builder, limit: () => builder,
+        from: () => builder, for: () => builder, limit: () => builder, orderBy: () => builder,
         where: (sql: SQL) => { predicate = sql; return builder; },
         then: (resolve: (value: unknown) => unknown) => Promise.resolve(result()).then(resolve),
       };
