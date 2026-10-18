@@ -2660,6 +2660,80 @@ pub async fn sync_cursor_cache_with_explicit_timeout(
     .await
 }
 
+/// The persisted budget to consult for a submit Cursor sync, if any.
+/// Only a submit without an explicit `--timeout` reads the setting.
+fn setting_budget_for_submit(
+    explicit_timeout: Option<Duration>,
+    load_setting: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    let flag_given = explicit_timeout.is_some_and(|timeout| !timeout.is_zero());
+    if !flag_given {
+        load_setting()
+    } else {
+        None
+    }
+}
+
+/// Timeout override for the submit Cursor usage download: if the user passed
+/// `--timeout` (or `--cursor-timeout`) or configured `cursor.syncTimeoutSeconds`
+/// in `settings.json`, use that budget with `is_custom = true`.
+/// Otherwise, returns `(None, false)` which uses the default 15s budget.
+fn sync_timeout_override_for_submit(
+    explicit_timeout: Option<Duration>,
+    configured_secs: Option<u64>,
+) -> (Option<Duration>, bool) {
+    if let Some(timeout) = explicit_timeout.filter(|timeout| !timeout.is_zero()) {
+        return (Some(timeout.min(max_sync_timeout())), true);
+    }
+
+    if let Some(secs) = configured_secs.filter(|secs| is_valid_sync_timeout_secs(*secs)) {
+        return (Some(Duration::from_secs(secs)), true);
+    }
+
+    (None, false)
+}
+
+pub async fn sync_cursor_cache_for_submit(explicit_timeout: Option<Duration>) -> SyncCursorResult {
+    let home = match home_dir() {
+        Ok(home) => home,
+        Err(error) => {
+            return SyncCursorResult {
+                synced: false,
+                rows: 0,
+                error: Some(format!("Failed to get home dir: {error}")),
+            };
+        }
+    };
+    sync_cursor_cache_for_submit_in_home(&home, explicit_timeout, configured_sync_timeout_secs)
+        .await
+}
+
+async fn sync_cursor_cache_for_submit_in_home<F>(
+    home: &Path,
+    explicit_timeout: Option<Duration>,
+    load_setting: F,
+) -> SyncCursorResult
+where
+    F: FnOnce() -> Option<u64>,
+{
+    if !cursor_desktop_auto_import_is_disabled_in_home(home) {
+        let _ = ensure_credentials_from_local_cursor();
+    }
+
+    let configured_secs = setting_budget_for_submit(explicit_timeout, load_setting);
+    let (timeout, is_custom) = sync_timeout_override_for_submit(explicit_timeout, configured_secs);
+    sync_cursor_cache_with_fetcher_in_home(home, move |fetch| async move {
+        fetch_cursor_usage_events_json(
+            &fetch.session_token,
+            timeout,
+            is_custom,
+            fetch.existing_cache.as_deref(),
+        )
+        .await
+    })
+    .await
+}
+
 /// Moves `file_path` into a newly created private directory under archive/.
 /// Keep its original filename and bytes, and never overwrite an earlier backup.
 ///
@@ -3392,6 +3466,74 @@ mod tests {
             sync_timeout_override(true, None, None),
             (Some(CURSOR_EXPLICIT_SYNC_TIMEOUT), false)
         );
+    }
+
+    #[test]
+    fn test_sync_timeout_override_for_submit_prefers_flag_then_setting_then_none() {
+        // The flag wins over the persisted setting.
+        assert_eq!(
+            sync_timeout_override_for_submit(Some(Duration::from_secs(300)), Some(600)),
+            (Some(Duration::from_secs(300)), true)
+        );
+        // Without a flag, `cursor.syncTimeoutSeconds` is the custom budget.
+        assert_eq!(
+            sync_timeout_override_for_submit(None, Some(600)),
+            (Some(Duration::from_secs(600)), true)
+        );
+        // Neither: returns (None, false), which uses default 15s budget.
+        assert_eq!(sync_timeout_override_for_submit(None, None), (None, false));
+        // Out of range setting falls back to (None, false).
+        assert_eq!(
+            sync_timeout_override_for_submit(None, Some(0)),
+            (None, false)
+        );
+        assert_eq!(
+            sync_timeout_override_for_submit(None, Some(CURSOR_MAX_SYNC_TIMEOUT_SECS + 1)),
+            (None, false)
+        );
+        // Flag is clamped to max.
+        assert_eq!(
+            sync_timeout_override_for_submit(Some(Duration::from_secs(u64::MAX)), None),
+            (
+                Some(Duration::from_secs(CURSOR_MAX_SYNC_TIMEOUT_SECS)),
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn test_setting_budget_for_submit_is_read_only_without_flag() {
+        let unreachable = || -> Option<u64> { panic!("the setting must not be read") };
+        assert_eq!(
+            setting_budget_for_submit(Some(Duration::from_secs(300)), unreachable),
+            None
+        );
+        assert_eq!(setting_budget_for_submit(None, || Some(600)), Some(600));
+        assert_eq!(
+            setting_budget_for_submit(Some(Duration::ZERO), || Some(600)),
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn test_sync_cursor_cache_for_submit_respects_disabled_auto_import() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        disable_cursor_desktop_auto_import_in_home(home)?;
+        assert!(cursor_desktop_auto_import_is_disabled_in_home(home));
+
+        let rt = tokio::runtime::Runtime::new()?;
+        let _result = rt.block_on(sync_cursor_cache_for_submit_in_home(
+            home,
+            Some(Duration::from_secs(30)),
+            || Some(60),
+        ));
+
+        assert!(
+            cursor_desktop_auto_import_is_disabled_in_home(home),
+            "submit sync must never clear disabled desktop discovery"
+        );
+        Ok(())
     }
 
     #[test]
