@@ -6,6 +6,7 @@ const mockState = vi.hoisted(() => {
   const validateSubmission = vi.fn();
   const generateSubmissionHash = vi.fn(() => "hash-123");
   const revalidateTag = vi.fn();
+  const revalidatePath = vi.fn();
   const revalidateUsernamePaths = vi.fn();
   const revalidateUserGroupLeaderboards = vi.fn();
   const getLeaderboardData = vi.fn();
@@ -19,6 +20,7 @@ const mockState = vi.hoisted(() => {
     validateSubmission,
     generateSubmissionHash,
     revalidateTag,
+    revalidatePath,
     revalidateUsernamePaths,
     revalidateUserGroupLeaderboards,
     getLeaderboardData,
@@ -28,6 +30,7 @@ const mockState = vi.hoisted(() => {
       validateSubmission.mockReset();
       generateSubmissionHash.mockClear();
       revalidateTag.mockClear();
+      revalidatePath.mockClear();
       revalidateUsernamePaths.mockReset();
       revalidateUserGroupLeaderboards.mockReset();
       getLeaderboardData.mockReset();
@@ -38,6 +41,7 @@ const mockState = vi.hoisted(() => {
 
 vi.mock("next/cache", () => ({
   revalidateTag: mockState.revalidateTag,
+  revalidatePath: mockState.revalidatePath,
 }));
 
 vi.mock("@/lib/auth/personalTokens", () => ({
@@ -327,6 +331,7 @@ describe("POST /api/submit - Automated Leaderboard Withholding (Issue #1473)", (
 
     expect(usersUpdates).toHaveLength(0);
     expect(moderationActionInserts).toHaveLength(0);
+    expect(mockState.revalidatePath).not.toHaveBeenCalled();
   });
 
   it("atomically withholds a spoofer with impossible active time rate and logs audit record", async () => {
@@ -393,6 +398,9 @@ describe("POST /api/submit - Automated Leaderboard Withholding (Issue #1473)", (
       action: "hide",
       reason: "Under investigation",
     });
+
+    expect(mockState.revalidatePath).toHaveBeenCalledWith("/");
+    expect(mockState.revalidatePath).toHaveBeenCalledWith("/leaderboard");
 
     expect(consoleWarnSpy).toHaveBeenCalledWith(
       expect.stringContaining("[moderation] Auto-withheld user alice (user-1):")

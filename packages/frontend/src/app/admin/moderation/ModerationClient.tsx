@@ -174,6 +174,7 @@ export default function ModerationClient() {
                     {isSystemWithheld ? (
                       <Badge
                         $variant="system"
+                        role="status"
                         data-status="system-withheld"
                         aria-label="System Withheld"
                         title="Automatically withheld by system"
@@ -183,6 +184,7 @@ export default function ModerationClient() {
                     ) : isAdminHidden ? (
                       <Badge
                         $variant="admin"
+                        role="status"
                         data-status="admin-hidden"
                         aria-label="Admin Hidden"
                         title={

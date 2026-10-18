@@ -1292,5 +1292,45 @@ describe("moderation withholding evaluation (Issue #1473)", () => {
       expect(splitOutputResult.reason).toContain("on 2026-04-30");
       expect(splitOutputResult.reason).toContain("12,000,000,000 output tokens");
     });
+
+    it("counts string and bigint scalar client.tokens values in sumClientsTokens", () => {
+      const stringTokensPayload: WithholdingSubmissionInput = {
+        contributions: [
+          {
+            date: "2026-04-30",
+            clients: [
+              {
+                client: "claude",
+                tokens: "600000000000",
+                cost: 100,
+              },
+            ],
+          },
+        ],
+      };
+
+      const stringResult = evaluateSubmissionForWithholding(stringTokensPayload);
+      expect(stringResult.shouldWithhold).toBe(true);
+      expect(stringResult.trigger).toBe("extreme_single_day_volume");
+
+      const bigintTokensPayload: WithholdingSubmissionInput = {
+        contributions: [
+          {
+            date: "2026-04-30",
+            clients: [
+              {
+                client: "claude",
+                tokens: 600_000_000_000n,
+                cost: 100,
+              },
+            ],
+          },
+        ],
+      };
+
+      const bigintResult = evaluateSubmissionForWithholding(bigintTokensPayload);
+      expect(bigintResult.shouldWithhold).toBe(true);
+      expect(bigintResult.trigger).toBe("extreme_single_day_volume");
+    });
   });
 });
