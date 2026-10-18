@@ -120,9 +120,9 @@ export function GraphContainer({ data, totalActiveTimeMs, sessionCount, mcpServe
 
   useEffect(() => {
     if (!initializedRef.current && yearContributions.length > 0) {
-      const activeDaysWithTokens = yearContributions.filter((c) => c.totals.tokens > 0);
-      if (activeDaysWithTokens.length > 0) {
-        const latestDay = activeDaysWithTokens[activeDaysWithTokens.length - 1];
+      const activeDays = yearContributions.filter(dayHasActivity);
+      if (activeDays.length > 0) {
+        const latestDay = activeDays[activeDays.length - 1];
         // Intentional one-time initialization on first data load
         // eslint-disable-next-line react-hooks/set-state-in-effect
         setSelectedDate(latestDay.date);
