@@ -59,7 +59,15 @@ export async function applyModerationAction(params: {
   action: ModerationAction;
   reason: string;
 }): Promise<{ changed: boolean; leaderboardHidden: boolean }> {
-  const { target, actorUserId, actorUsername, action, reason } = params;
+  const { target, actorUserId, action, reason } = params;
+  const actorUsername = params.actorUsername?.trim() ?? "";
+  if (!actorUsername) {
+    throw new Error("Actor username is required");
+  }
+  const trimmedReason = reason?.trim() ?? "";
+  if (!trimmedReason) {
+    throw new Error("A reason is required");
+  }
   const nextHidden = action === "hide";
 
   const changed = await db.transaction(async (tx) => {
@@ -89,7 +97,7 @@ export async function applyModerationAction(params: {
       actorUserId,
       actorUsername,
       action,
-      reason,
+      reason: trimmedReason,
     });
 
     return updatedTarget.username;

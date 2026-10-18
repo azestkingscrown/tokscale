@@ -579,4 +579,25 @@ describe("aggregateUnknowableStats", () => {
     expect(stats.unattributedTokens).toBe(1n);
     expect(stats.unknowableTotalTokens).toBe(9_007_199_254_740_996n);
   });
+
+  it("preserves latest moderation action metadata in scoreCandidate and rankCandidates", () => {
+    const candidate = row({
+      username: "spoofer",
+      leaderboardHidden: true,
+      latestActorUsername: "system",
+      latestAction: "hide",
+      latestActionReason: "Under investigation",
+    });
+
+    const scored = scoreCandidate(candidate, CONTEXT);
+    expect(scored.latestActorUsername).toBe("system");
+    expect(scored.latestAction).toBe("hide");
+    expect(scored.latestActionReason).toBe("Under investigation");
+
+    const ranked = rankCandidates([candidate], CONTEXT);
+    expect(ranked).toHaveLength(1);
+    expect(ranked[0].latestActorUsername).toBe("system");
+    expect(ranked[0].latestAction).toBe("hide");
+    expect(ranked[0].latestActionReason).toBe("Under investigation");
+  });
 });
