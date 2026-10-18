@@ -39,6 +39,9 @@ interface CandidateDbRow extends Record<string, unknown> {
   attributed_tokens: number | string | null;
   site_tokens: number | string | null;
   median_tokens: number | string | null;
+  latest_actor_username?: string | null;
+  latest_action?: string | null;
+  latest_action_reason?: string | null;
 }
 
 /**
@@ -281,6 +284,16 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         ) AS median_tokens
       FROM per_user
     ),
+    latest_mod AS (
+      SELECT DISTINCT ON (target_user_id)
+        target_user_id,
+        actor_username,
+        action,
+        reason
+      FROM moderation_actions
+      WHERE target_user_id IS NOT NULL
+      ORDER BY target_user_id, created_at DESC
+    ),
     enriched AS (
       SELECT
         p.*,
@@ -327,10 +340,14 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
           ) - 1
         ELSE 0 END AS near_duplicate_count,
         site.site_tokens,
-        site.median_tokens
+        site.median_tokens,
+        lm.actor_username AS latest_actor_username,
+        lm.action AS latest_action,
+        lm.reason AS latest_action_reason
       FROM per_user p
       LEFT JOIN daily dl ON dl.submission_id = p.submission_id
       LEFT JOIN slop_usage su ON su.submission_id = p.submission_id
+      LEFT JOIN latest_mod lm ON lm.target_user_id = p.user_id
       CROSS JOIN site
     ),
     eligible AS (
@@ -352,7 +369,8 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
       total_cost, submit_count, has_backfill, daily_tokens,
       near_duplicate_count, slop_models, slop_tokens,
       has_over_nested_entry, every_day_attributed, attributed_tokens,
-      site_tokens, median_tokens
+      site_tokens, median_tokens,
+      latest_actor_username, latest_action, latest_action_reason
     FROM eligible
   `);
 
@@ -375,6 +393,18 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
     everyDayAttributed: row.every_day_attributed === true,
     attributedTokens: toBigInt(row.attributed_tokens),
     totalTokensExact: toBigInt(row.total_tokens),
+    latestActorUsername:
+      typeof row.latest_actor_username === "string"
+        ? row.latest_actor_username
+        : null,
+    latestAction:
+      typeof row.latest_action === "string"
+        ? row.latest_action
+        : null,
+    latestActionReason:
+      typeof row.latest_action_reason === "string"
+        ? row.latest_action_reason
+        : null,
   }));
 
   const stats = aggregateUnknowableStats(rows);

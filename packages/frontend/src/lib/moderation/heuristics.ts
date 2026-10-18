@@ -87,6 +87,18 @@ export interface CandidateRow {
    * field instead.
    */
   totalTokensExact: bigint;
+  /**
+   * Actor who performed the latest moderation action on this user ("system" or admin username).
+   */
+  latestActorUsername?: string | null;
+  /**
+   * Action of the most recent moderation action ("hide" | "unhide").
+   */
+  latestAction?: string | null;
+  /**
+   * Reason recorded in the most recent moderation action.
+   */
+  latestActionReason?: string | null;
 }
 
 export interface CandidateContext {
