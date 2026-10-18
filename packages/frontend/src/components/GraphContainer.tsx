@@ -103,7 +103,7 @@ export function GraphContainer({ data, totalActiveTimeMs, sessionCount, mcpServe
   const maxTokens = useMemo(() => Math.max(...yearContributions.map((c) => c.totals.tokens), 0), [yearContributions]);
   const totalCost = useMemo(() => yearContributions.reduce((sum, c) => sum + c.totals.cost, 0), [yearContributions]);
   const totalTokens = useMemo(() => yearContributions.reduce((sum, c) => sum + c.totals.tokens, 0), [yearContributions]);
-  const activeDays = useMemo(() => yearContributions.filter((c) => c.totals.tokens > 0).length, [yearContributions]);
+  const activeDays = useMemo(() => yearContributions.filter((c) => c.totals.tokens > 0 || c.totals.cost > 0).length, [yearContributions]);
   const bestDay = useMemo(() => findBestDay(yearContributions), [yearContributions]);
   const currentStreak = useMemo(() => calculateCurrentStreak(yearContributions), [yearContributions]);
   const longestStreak = useMemo(() => calculateLongestStreak(yearContributions), [yearContributions]);

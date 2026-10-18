@@ -704,8 +704,9 @@ export function createContributionCalendar(
   }
 
   return {
-    activeDays: selectableContributions.filter(({ tokens }) => tokens > 0)
-      .length,
+    activeDays: selectableContributions.filter(
+      ({ cost, tokens }) => tokens > 0 || cost > 0,
+    ).length,
     cells,
     endDate: toDateKey(lastTimestamp),
     freeTokenDays: selectableContributions.filter(
