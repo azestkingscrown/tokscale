@@ -292,7 +292,7 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         reason
       FROM moderation_actions
       WHERE target_user_id IS NOT NULL
-      ORDER BY target_user_id, created_at DESC
+      ORDER BY target_user_id, created_at DESC, id DESC
     ),
     enriched AS (
       SELECT

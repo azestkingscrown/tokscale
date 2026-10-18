@@ -129,6 +129,7 @@ function makeAwaitableBuilder(result: unknown) {
 
 interface MockTxOptions {
   userLeaderboardHidden?: boolean;
+  usersUpdateReturnedRows?: Array<{ id: string }>;
   latestModAction?: { action: string; actorUsername: string | null } | null;
   aggregates?: {
     totalTokens: number;
@@ -148,6 +149,7 @@ interface MockTxOptions {
 
 function setupMockTx(options: MockTxOptions = {}) {
   const userHidden = options.userLeaderboardHidden ?? false;
+  const usersReturned = options.usersUpdateReturnedRows ?? [{ id: "user-1" }];
   const latestAction = options.latestModAction !== undefined ? options.latestModAction : null;
 
   const aggregates = options.aggregates ?? {
@@ -234,7 +236,15 @@ function setupMockTx(options: MockTxOptions = {}) {
           }
           return builder;
         }),
-        where: vi.fn(() => Promise.resolve()),
+        where: vi.fn(() => {
+          if (table === users) {
+            return {
+              returning: vi.fn(() => Promise.resolve(usersReturned)),
+              then: (resolve: (value: unknown) => unknown) => Promise.resolve(resolve(usersReturned)),
+            };
+          }
+          return Promise.resolve();
+        }),
       };
       return builder;
     }),
@@ -827,5 +837,179 @@ describe("POST /api/submit - Automated Leaderboard Withholding (Issue #1473)", (
       actorUsername: "system",
       reason: "Under investigation",
     });
+  });
+
+  it("withholds submission when client has a partial models map and a slop top-level modelId carrying the remainder", async () => {
+    const { usersUpdates, moderationActionInserts } = setupMockTx({
+      userLeaderboardHidden: false,
+      aggregates: {
+        totalTokens: 1_500_000,
+        totalCost: "1.5000",
+        inputTokens: 1_500_000,
+        outputTokens: 0,
+      },
+      allDaysSourceBreakdown: {
+        claude: {
+          tokens: 1_500_000,
+          cost: 1.5,
+          input: 1_500_000,
+          output: 0,
+          modelId: "slop-opus-4-6",
+          models: {
+            "gpt-4o": {
+              tokens: 2,
+              output: 0,
+            },
+          },
+        },
+      },
+    });
+
+    mockState.validateSubmission.mockReturnValue({
+      valid: true,
+      data: {
+        device: { id: "dev-1", name: "Laptop" },
+        meta: { version: "1.0.0", dateRange: { start: "2026-04-30", end: "2026-04-30" } },
+        summary: { clients: ["claude"] },
+        contributions: [{ date: "2026-04-30", clients: [] }],
+      },
+      errors: [],
+      warnings: [],
+    });
+
+    const response = await POST(createRequest({}));
+    expect(response.status).toBe(200);
+
+    expect(usersUpdates).toHaveLength(1);
+    expect(usersUpdates[0]).toMatchObject({ leaderboardHidden: true });
+    expect(moderationActionInserts).toHaveLength(1);
+    expect(moderationActionInserts[0]).toMatchObject({
+      action: "hide",
+      actorUsername: "system",
+      reason: "Under investigation",
+    });
+  });
+
+  it("aggregates daily_breakdown rows across multiple devices on the same calendar date to catch split daily violations", async () => {
+    const { usersUpdates, moderationActionInserts } = setupMockTx({
+      userLeaderboardHidden: false,
+      aggregates: {
+        totalTokens: 12_000_000_000,
+        totalCost: "1200.0000",
+        inputTokens: 0,
+        outputTokens: 12_000_000_000,
+      },
+      deviceTotals: {
+        totalActiveTimeMs: 3600_000_000,
+        longestContinuousMs: 3600_000_000,
+        maxConcurrentSessions: 10,
+        sessionCount: 10,
+      },
+      allDaysRows: [
+        {
+          date: "2026-04-30",
+          tokens: 6_000_000_000,
+          cost: "600.0000",
+          inputTokens: 0,
+          outputTokens: 6_000_000_000,
+          sourceBreakdown: {
+            claude: {
+              tokens: 6_000_000_000,
+              cost: 600,
+              input: 0,
+              output: 6_000_000_000,
+              models: {
+                "claude-3-5-sonnet-20241022": {
+                  tokens: 6_000_000_000,
+                  output: 6_000_000_000,
+                },
+              },
+            },
+          },
+        },
+        {
+          date: "2026-04-30",
+          tokens: 6_000_000_000,
+          cost: "600.0000",
+          inputTokens: 0,
+          outputTokens: 6_000_000_000,
+          sourceBreakdown: {
+            claude: {
+              tokens: 6_000_000_000,
+              cost: 600,
+              input: 0,
+              output: 6_000_000_000,
+              models: {
+                "claude-3-5-sonnet-20241022": {
+                  tokens: 6_000_000_000,
+                  output: 6_000_000_000,
+                },
+              },
+            },
+          },
+        },
+      ],
+    });
+
+    mockState.validateSubmission.mockReturnValue({
+      valid: true,
+      data: {
+        device: { id: "dev-1", name: "Laptop" },
+        meta: { version: "1.0.0", dateRange: { start: "2026-04-30", end: "2026-04-30" } },
+        summary: { clients: ["claude"] },
+        contributions: [{ date: "2026-04-30", clients: [] }],
+      },
+      errors: [],
+      warnings: [],
+    });
+
+    const response = await POST(createRequest({}));
+    expect(response.status).toBe(200);
+
+    expect(usersUpdates).toHaveLength(1);
+    expect(usersUpdates[0]).toMatchObject({ leaderboardHidden: true });
+    expect(moderationActionInserts).toHaveLength(1);
+    expect(moderationActionInserts[0]).toMatchObject({
+      action: "hide",
+      actorUsername: "system",
+      reason: "Under investigation",
+    });
+  });
+
+  it("does not insert a system moderation_actions row if a concurrent admin action already hid the user", async () => {
+    const { usersUpdates, moderationActionInserts } = setupMockTx({
+      userLeaderboardHidden: false,
+      usersUpdateReturnedRows: [], // Simulates WHERE leaderboard_hidden = false matching 0 rows due to concurrent admin hide
+      aggregates: {
+        totalTokens: 50_000_000,
+        totalCost: "50.0000",
+        inputTokens: 0,
+        outputTokens: 50_000_000,
+      },
+      deviceTotals: {
+        totalActiveTimeMs: 10_000,
+        longestContinuousMs: 10_000,
+        maxConcurrentSessions: 1,
+        sessionCount: 1,
+      },
+    });
+
+    mockState.validateSubmission.mockReturnValue({
+      valid: true,
+      data: {
+        device: { id: "dev-1", name: "Laptop" },
+        meta: { version: "1.0.0", dateRange: { start: "2026-04-30", end: "2026-04-30" } },
+        summary: { clients: ["claude"] },
+        contributions: [{ date: "2026-04-30", clients: [] }],
+      },
+      errors: [],
+      warnings: [],
+    });
+
+    const response = await POST(createRequest({}));
+    expect(response.status).toBe(200);
+
+    expect(usersUpdates).toHaveLength(1);
+    expect(moderationActionInserts).toHaveLength(0);
   });
 });

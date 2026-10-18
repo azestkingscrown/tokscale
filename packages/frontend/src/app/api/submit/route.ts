@@ -1,4 +1,5 @@
 import { NextResponse, after } from "next/server";
+import * as nextCache from "next/cache";
 import { revalidateTag } from "next/cache";
 import { db, apiTokens, submissions, submittedDevices, dailyBreakdown } from "@/lib/db";
 import { users, moderationActions } from "@/lib/db/schema";
@@ -1441,6 +1442,7 @@ export async function POST(request: Request) {
 
       const allDays = await tx
         .select({
+          date: dailyBreakdown.date,
           sourceBreakdown: dailyBreakdown.sourceBreakdown,
         })
         .from(dailyBreakdown)
@@ -1459,15 +1461,21 @@ export async function POST(request: Request) {
             const clientName = rawClientName === "kilocode" ? "kilo" : rawClientName;
             allClients.add(clientName);
             const cd = clientData as ClientBreakdownData;
+            let nestedTokensSum = 0;
             if (cd.models) {
               for (const [modelId, mData] of Object.entries(cd.models)) {
                 allModels.add(modelId);
                 const tokens = typeof mData === "number" ? mData : (mData?.tokens ?? 0);
+                nestedTokensSum += tokens;
                 mergedModelTokens[modelId] = (mergedModelTokens[modelId] ?? 0) + tokens;
               }
-            } else if (cd.modelId) {
+            }
+            if (cd.modelId) {
               allModels.add(cd.modelId);
-              mergedModelTokens[cd.modelId] = (mergedModelTokens[cd.modelId] ?? 0) + (cd.tokens ?? 0);
+              const remainderTokens = Math.max(0, (cd.tokens ?? 0) - nestedTokensSum);
+              if (remainderTokens > 0 || !(cd.modelId in mergedModelTokens)) {
+                mergedModelTokens[cd.modelId] = (mergedModelTokens[cd.modelId] ?? 0) + remainderTokens;
+              }
             }
             totalCacheRead += cd.cacheRead || 0;
             totalCacheCreation += cd.cacheWrite || 0;
@@ -1546,6 +1554,7 @@ export async function POST(request: Request) {
         .where(eq(submissions.id, submissionId));
 
       // Automated leaderboard withholding (Issue #1473)
+      let autoWithheld = false;
       if (process.env.ENABLE_SUBMISSION_AUTOHIDE !== "0" && users && moderationActions) {
         const [currentUser] = await tx
           .select({ leaderboardHidden: users.leaderboardHidden })
@@ -1561,7 +1570,7 @@ export async function POST(request: Request) {
             })
             .from(moderationActions)
             .where(eq(moderationActions.targetUserId, tokenRecord.userId))
-            .orderBy(desc(moderationActions.createdAt))
+            .orderBy(desc(moderationActions.createdAt), desc(moderationActions.id))
             .limit(1);
 
           const modActor = latestModAction?.actorUsername?.trim().toLowerCase();
@@ -1571,7 +1580,10 @@ export async function POST(request: Request) {
             modActor !== "system";
 
           if (!isAdminApproved) {
-            const dailyContributions: WithholdingDailyContribution[] = allDays.map((day) => {
+            const dailyByDate = new Map<string, WithholdingDailyContribution>();
+            const undatedContributions: WithholdingDailyContribution[] = [];
+
+            for (const day of allDays) {
               const clientsList: WithholdingClientContribution[] = [];
               let dayOutput = 0;
               let dayTokens = 0;
@@ -1591,18 +1603,63 @@ export async function POST(request: Request) {
                   dayInput += typeof cd.input === "number" ? cd.input : 0;
                 }
               }
-              return {
-                totals: {
-                  tokens: dayTokens,
-                  cost: dayCost > 0 ? String(dayCost) : undefined,
-                },
-                tokenBreakdown: {
-                  input: dayInput,
-                  output: dayOutput,
-                },
-                clients: clientsList,
-              };
-            });
+
+              const dayDate =
+                typeof (day as { date?: unknown }).date === "string" &&
+                (day as { date: string }).date.trim()
+                  ? (day as { date: string }).date.trim()
+                  : undefined;
+
+              if (dayDate) {
+                const existing = dailyByDate.get(dayDate);
+                if (existing) {
+                  const prevTokens = Number(existing.totals?.tokens ?? 0);
+                  const prevCost = Number(existing.totals?.cost ?? 0);
+                  const prevInput = Number(existing.tokenBreakdown?.input ?? 0);
+                  const prevOutput = Number(existing.tokenBreakdown?.output ?? 0);
+                  const nextCost = prevCost + dayCost;
+                  existing.totals = {
+                    tokens: prevTokens + dayTokens,
+                    cost: nextCost > 0 ? String(nextCost) : undefined,
+                  };
+                  existing.tokenBreakdown = {
+                    input: prevInput + dayInput,
+                    output: prevOutput + dayOutput,
+                  };
+                  existing.clients = [...(existing.clients ?? []), ...clientsList];
+                } else {
+                  dailyByDate.set(dayDate, {
+                    date: dayDate,
+                    totals: {
+                      tokens: dayTokens,
+                      cost: dayCost > 0 ? String(dayCost) : undefined,
+                    },
+                    tokenBreakdown: {
+                      input: dayInput,
+                      output: dayOutput,
+                    },
+                    clients: clientsList,
+                  });
+                }
+              } else {
+                undatedContributions.push({
+                  totals: {
+                    tokens: dayTokens,
+                    cost: dayCost > 0 ? String(dayCost) : undefined,
+                  },
+                  tokenBreakdown: {
+                    input: dayInput,
+                    output: dayOutput,
+                  },
+                  clients: clientsList,
+                });
+              }
+            }
+
+            const dailyContributions: WithholdingDailyContribution[] = [
+              ...dailyByDate.values(),
+              ...undatedContributions,
+            ];
 
             const withholdingResult = evaluateSubmissionForWithholding({
               totalTokens: aggregates.totalTokens,
@@ -1620,26 +1677,43 @@ export async function POST(request: Request) {
             });
 
             if (withholdingResult.shouldWithhold) {
-              await tx
+              const updateQuery = tx
                 .update(users)
                 .set({
                   leaderboardHidden: true,
                   updatedAt: new Date(),
                 })
-                .where(eq(users.id, tokenRecord.userId));
+                .where(
+                  and(
+                    eq(users.id, tokenRecord.userId),
+                    eq(users.leaderboardHidden, false),
+                  ),
+                );
 
-              await tx.insert(moderationActions).values({
-                targetUserId: tokenRecord.userId,
-                targetUsername: tokenRecord.username,
-                actorUserId: null,
-                actorUsername: "system",
-                action: "hide",
-                reason: "Under investigation",
-              });
+              const updatedRows =
+                typeof (updateQuery as { returning?: unknown })?.returning === "function"
+                  ? await (
+                      updateQuery as unknown as {
+                        returning: (cols: { id: unknown }) => Promise<Array<{ id: string }>>;
+                      }
+                    ).returning({ id: users.id })
+                  : (await updateQuery, [{ id: tokenRecord.userId }]);
 
-              console.warn(
-                `[moderation] Auto-withheld user ${tokenRecord.username} (${tokenRecord.userId}): ${withholdingResult.reason}`
-              );
+              if (updatedRows.length > 0) {
+                autoWithheld = true;
+                await tx.insert(moderationActions).values({
+                  targetUserId: tokenRecord.userId,
+                  targetUsername: tokenRecord.username,
+                  actorUserId: null,
+                  actorUsername: "system",
+                  action: "hide",
+                  reason: "Under investigation",
+                });
+
+                console.warn(
+                  `[moderation] Auto-withheld user ${tokenRecord.username} (${tokenRecord.userId}): ${withholdingResult.reason}`
+                );
+              }
             }
           }
         }
@@ -1662,6 +1736,7 @@ export async function POST(request: Request) {
       return {
         submissionId,
         isNewSubmission,
+        autoWithheld,
         metrics: {
           totalTokens:
             aggregates.totalTokens >= 9007199254740991
@@ -1694,6 +1769,10 @@ export async function POST(request: Request) {
       revalidateTag(`user:${usernameCacheKey}`, "max");
       revalidateTag("user-rank", "max");
       revalidateTag(`user-rank:${usernameCacheKey}`, "max");
+      if (result.autoWithheld && "revalidatePath" in nextCache && typeof nextCache.revalidatePath === "function") {
+        nextCache.revalidatePath("/");
+        nextCache.revalidatePath("/leaderboard");
+      }
     } catch (e) {
       console.error("Public cache invalidation failed:", e);
     }
