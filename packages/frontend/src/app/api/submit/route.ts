@@ -1,12 +1,18 @@
 import { NextResponse, after } from "next/server";
 import { revalidateTag } from "next/cache";
 import { db, apiTokens, submissions, submittedDevices, dailyBreakdown } from "@/lib/db";
-import { and, eq, sql } from "drizzle-orm";
+import { users, moderationActions } from "@/lib/db/schema";
+import { and, desc, eq, sql } from "drizzle-orm";
 import {
   validateSubmission,
   generateSubmissionHash,
   type SubmissionData,
 } from "@/lib/validation/submission";
+import {
+  evaluateSubmissionForWithholding,
+  type WithholdingDailyContribution,
+  type WithholdingClientContribution,
+} from "@/lib/moderation/withholding";
 import { authenticatePersonalToken } from "@/lib/auth/personalTokens";
 import { getBearerToken } from "../../../lib/auth/bearerToken";
 import {
@@ -1442,6 +1448,7 @@ export async function POST(request: Request) {
 
       const allClients = new Set<string>();
       const allModels = new Set<string>();
+      const mergedModelTokens: Record<string, number> = {};
       let totalCacheRead = 0;
       let totalCacheCreation = 0;
       let totalReasoning = 0;
@@ -1453,11 +1460,14 @@ export async function POST(request: Request) {
             allClients.add(clientName);
             const cd = clientData as ClientBreakdownData;
             if (cd.models) {
-              for (const modelId of Object.keys(cd.models)) {
+              for (const [modelId, mData] of Object.entries(cd.models)) {
                 allModels.add(modelId);
+                const tokens = typeof mData === "number" ? mData : (mData?.tokens ?? 0);
+                mergedModelTokens[modelId] = (mergedModelTokens[modelId] ?? 0) + tokens;
               }
             } else if (cd.modelId) {
               allModels.add(cd.modelId);
+              mergedModelTokens[cd.modelId] = (mergedModelTokens[cd.modelId] ?? 0) + (cd.tokens ?? 0);
             }
             totalCacheRead += cd.cacheRead || 0;
             totalCacheCreation += cd.cacheWrite || 0;
@@ -1465,6 +1475,23 @@ export async function POST(request: Request) {
           }
         }
       }
+
+      const mergedActiveTimeMs = Math.max(
+        deviceTotals?.totalActiveTimeMs ?? 0,
+        storedSessionMetrics?.totalActiveTimeMs ?? 0,
+      );
+      const mergedLongestContinuousMs = Math.max(
+        deviceTotals?.longestContinuousMs ?? 0,
+        storedSessionMetrics?.longestContinuousMs ?? 0,
+      );
+      const mergedMaxConcurrentSessions = Math.max(
+        deviceTotals?.maxConcurrentSessions ?? 0,
+        storedSessionMetrics?.maxConcurrentSessions ?? 0,
+      );
+      const mergedSessionCount = Math.max(
+        deviceTotals?.sessionCount ?? 0,
+        storedSessionMetrics?.sessionCount ?? 0,
+      );
 
       // ------------------------------------------
       // STEP 3e: Update submission record
@@ -1509,26 +1536,114 @@ export async function POST(request: Request) {
           // pre-migration TZ re-split stays frozen at the inflated value; the
           // floor can only hold it, never correct it down. New inflation is
           // prevented, historical inflation is not repaired.
-          totalActiveTimeMs: Math.max(
-            deviceTotals?.totalActiveTimeMs ?? 0,
-            storedSessionMetrics?.totalActiveTimeMs ?? 0,
-          ),
-          longestContinuousMs: Math.max(
-            deviceTotals?.longestContinuousMs ?? 0,
-            storedSessionMetrics?.longestContinuousMs ?? 0,
-          ),
-          maxConcurrentSessions: Math.max(
-            deviceTotals?.maxConcurrentSessions ?? 0,
-            storedSessionMetrics?.maxConcurrentSessions ?? 0,
-          ),
-          sessionCount: Math.max(
-            deviceTotals?.sessionCount ?? 0,
-            storedSessionMetrics?.sessionCount ?? 0,
-          ),
+          totalActiveTimeMs: mergedActiveTimeMs,
+          longestContinuousMs: mergedLongestContinuousMs,
+          maxConcurrentSessions: mergedMaxConcurrentSessions,
+          sessionCount: mergedSessionCount,
           mcpServers: mcpServers && mcpServers.length > 0 ? mcpServers : null,
           updatedAt: new Date(),
         })
         .where(eq(submissions.id, submissionId));
+
+      // Automated leaderboard withholding (Issue #1473)
+      if (process.env.ENABLE_SUBMISSION_AUTOHIDE !== "0" && users && moderationActions) {
+        const [currentUser] = await tx
+          .select({ leaderboardHidden: users.leaderboardHidden })
+          .from(users)
+          .where(eq(users.id, tokenRecord.userId))
+          .limit(1);
+
+        if (!currentUser?.leaderboardHidden) {
+          const [latestModAction] = await tx
+            .select({
+              action: moderationActions.action,
+              actorUsername: moderationActions.actorUsername,
+            })
+            .from(moderationActions)
+            .where(eq(moderationActions.targetUserId, tokenRecord.userId))
+            .orderBy(desc(moderationActions.createdAt))
+            .limit(1);
+
+          const modActor = latestModAction?.actorUsername?.trim().toLowerCase();
+          const isAdminApproved =
+            latestModAction?.action === "unhide" &&
+            Boolean(modActor) &&
+            modActor !== "system";
+
+          if (!isAdminApproved) {
+            const dailyContributions: WithholdingDailyContribution[] = allDays.map((day) => {
+              const clientsList: WithholdingClientContribution[] = [];
+              let dayOutput = 0;
+              let dayTokens = 0;
+              let dayCost = 0;
+              let dayInput = 0;
+              if (day.sourceBreakdown) {
+                for (const [rawClientName, clientData] of Object.entries(day.sourceBreakdown)) {
+                  const clientName = rawClientName === "kilocode" ? "kilo" : rawClientName;
+                  const cd = clientData as ClientBreakdownData;
+                  clientsList.push({
+                    client: clientName,
+                    ...cd,
+                  });
+                  dayTokens += typeof cd.tokens === "number" ? cd.tokens : 0;
+                  dayCost += typeof cd.cost === "number" ? cd.cost : 0;
+                  dayOutput += typeof cd.output === "number" ? cd.output : 0;
+                  dayInput += typeof cd.input === "number" ? cd.input : 0;
+                }
+              }
+              return {
+                totals: {
+                  tokens: dayTokens,
+                  cost: dayCost > 0 ? String(dayCost) : undefined,
+                },
+                tokenBreakdown: {
+                  input: dayInput,
+                  output: dayOutput,
+                },
+                clients: clientsList,
+              };
+            });
+
+            const withholdingResult = evaluateSubmissionForWithholding({
+              totalTokens: aggregates.totalTokens,
+              totalCost: aggregates.totalCost,
+              outputTokens: aggregates.outputTokens,
+              models: Array.from(allModels),
+              modelTokens: mergedModelTokens,
+              contributions: dailyContributions,
+              timeMetrics: {
+                totalActiveTimeMs: mergedActiveTimeMs,
+                longestContinuousMs: mergedLongestContinuousMs,
+                maxConcurrentSessions: mergedMaxConcurrentSessions,
+                sessionCount: mergedSessionCount,
+              },
+            });
+
+            if (withholdingResult.shouldWithhold) {
+              await tx
+                .update(users)
+                .set({
+                  leaderboardHidden: true,
+                  updatedAt: new Date(),
+                })
+                .where(eq(users.id, tokenRecord.userId));
+
+              await tx.insert(moderationActions).values({
+                targetUserId: tokenRecord.userId,
+                targetUsername: tokenRecord.username,
+                actorUserId: null,
+                actorUsername: "system",
+                action: "hide",
+                reason: "Under investigation",
+              });
+
+              console.warn(
+                `[moderation] Auto-withheld user ${tokenRecord.username} (${tokenRecord.userId}): ${withholdingResult.reason}`
+              );
+            }
+          }
+        }
+      }
 
       // Register durable post-commit work before the transaction exposes its
       // daily rows. If this invocation is interrupted after commit, a later
