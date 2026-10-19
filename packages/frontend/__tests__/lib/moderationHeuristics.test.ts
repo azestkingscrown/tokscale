@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  MIN_REVIEW_COST,
+  REVIEW_MAX_OUTPUT_TOKENS_PER_ACTIVE_SECOND,
+  REVIEW_OUTPUT_TOKEN_FLOOR,
   SLOP_MODEL_REGEX,
   UNKNOWABLE_BUCKET_WIDTH,
   aggregateUnknowableStats,
@@ -230,6 +233,75 @@ describe("scoreCandidate", () => {
     );
 
     expect(signalKeys(tooExpensive)).toContain("impliedRate");
+  });
+
+  it.each([
+    { cost: MIN_REVIEW_COST - 0.01, flagged: false },
+    { cost: MIN_REVIEW_COST, flagged: true },
+    { cost: MIN_REVIEW_COST + 0.01, flagged: true },
+  ])("gates implied-rate review at token-attributed cost $cost", ({ cost, flagged }) => {
+    const scored = scoreCandidate(
+      row({
+        totalTokens: 1000,
+        dailyTokens: 1000,
+        totalCost: 500,
+        tokenAttributedCost: cost,
+      }),
+      CONTEXT
+    );
+
+    expect(signalKeys(scored)).toEqual(flagged ? ["impliedRate"] : []);
+    expect(scored.score).toBe(flagged ? 15 : 0);
+  });
+
+  it.each([
+    { rate: REVIEW_MAX_OUTPUT_TOKENS_PER_ACTIVE_SECOND - 1, flagged: false },
+    { rate: REVIEW_MAX_OUTPUT_TOKENS_PER_ACTIVE_SECOND, flagged: false },
+    { rate: REVIEW_MAX_OUTPUT_TOKENS_PER_ACTIVE_SECOND + 1, flagged: true },
+  ])("checks the recorded output-rate boundary at $rate tokens/sec", ({ rate, flagged }) => {
+    const outputTokens = REVIEW_OUTPUT_TOKEN_FLOOR * 2;
+    const scored = scoreCandidate(
+      row({
+        totalTokens: outputTokens,
+        dailyTokens: outputTokens,
+        outputTokens,
+        totalActiveTimeMs: (outputTokens / rate) * 1000,
+      }),
+      CONTEXT
+    );
+
+    expect(signalKeys(scored)).toEqual(flagged ? ["outputRate"] : []);
+    expect(scored.score).toBe(flagged ? 10 : 0);
+  });
+
+  it.each([
+    { outputTokens: REVIEW_OUTPUT_TOKEN_FLOOR - 1, flagged: false },
+    { outputTokens: REVIEW_OUTPUT_TOKEN_FLOOR, flagged: true },
+    { outputTokens: REVIEW_OUTPUT_TOKEN_FLOOR + 1, flagged: true },
+  ])("requires enough output before reviewing its rate: $outputTokens tokens", ({ outputTokens, flagged }) => {
+    const scored = scoreCandidate(
+      row({
+        totalTokens: outputTokens,
+        dailyTokens: outputTokens,
+        outputTokens,
+        totalActiveTimeMs: 1000,
+      }),
+      CONTEXT
+    );
+
+    expect(signalKeys(scored)).toEqual(flagged ? ["outputRate"] : []);
+  });
+
+  it.each([undefined, 0])("does not infer an output rate from active time %s", (activeTimeMs) => {
+    const scored = scoreCandidate(
+      row({
+        outputTokens: REVIEW_OUTPUT_TOKEN_FLOOR,
+        totalActiveTimeMs: activeTimeMs,
+      }),
+      CONTEXT
+    );
+
+    expect(scored.signals).toEqual([]);
   });
 
   it("does not flag a very low implied rate, which local and free models produce", () => {

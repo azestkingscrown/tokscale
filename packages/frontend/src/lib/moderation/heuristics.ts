@@ -423,7 +423,7 @@ export const SITE_SHARE_THRESHOLD = 0.05;
 /** Multiples of the median that stop being explainable as heavy usage. */
 export const MEDIAN_RATIO_THRESHOLD = 500;
 /**
- * Only an upper bound. There is deliberately no floor.
+ * Only an upper per-token rate bound. There is deliberately no rate floor.
  *
  * A low implied rate carries no signal: local models via Ollama or LM Studio
  * cost nothing, free tiers cost nothing, and cache reads are an order of
@@ -435,8 +435,22 @@ export const MEDIAN_RATIO_THRESHOLD = 500;
  * The ceiling still means something: nobody pays above list price.
  */
 export const MAX_IMPLIED_RATE = 0.001;
+/**
+ * Require $10 of token-attributed cost to keep small absolute pricing and
+ * attribution discrepancies out of the queue. This is a review gate on cost,
+ * not a lower bound on per-token rates.
+ */
 export const MIN_REVIEW_COST = 10;
+/**
+ * Require one million output tokens before considering the recorded rate.
+ * Smaller samples can magnify brief or incomplete active-time measurements.
+ */
 export const REVIEW_OUTPUT_TOKEN_FLOOR = 1_000_000;
+/**
+ * A deliberately high review threshold of 10,000 output tokens per active
+ * second keeps ordinary recorded rates out of the queue. Partial active-time
+ * coverage can exceed it, so this is advisory rather than a physical limit.
+ */
 export const REVIEW_MAX_OUTPUT_TOKENS_PER_ACTIVE_SECOND = 10_000;
 /**
  * Daily rows should sum to roughly the stored total. A large gap is the
