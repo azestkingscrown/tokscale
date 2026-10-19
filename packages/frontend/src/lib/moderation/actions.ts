@@ -1,4 +1,4 @@
-import { and, desc, eq, ne } from "drizzle-orm";
+import { and, desc, eq, ne, sql } from "drizzle-orm";
 import { revalidatePath, revalidateTag } from "next/cache";
 import { db, moderationActions, users } from "@/lib/db";
 import {
@@ -98,6 +98,9 @@ export async function applyModerationAction(params: {
       actorUsername,
       action,
       reason: trimmedReason,
+      // The user row remains locked until commit. now() would instead record
+      // BEGIN time and can sort a delayed decision before an earlier change.
+      createdAt: sql`clock_timestamp()`,
     });
 
     return updatedTarget.username;
@@ -152,7 +155,7 @@ export async function getModerationHistory(
     })
     .from(moderationActions)
     .where(eq(moderationActions.targetUserId, targetUserId))
-    .orderBy(desc(moderationActions.createdAt))
+    .orderBy(desc(moderationActions.createdAt), desc(moderationActions.id))
     .limit(limit);
 
   return rows;

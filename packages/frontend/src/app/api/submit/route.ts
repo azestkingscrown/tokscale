@@ -1825,6 +1825,9 @@ export async function POST(request: Request) {
                 actorUsername: "system",
                 action: "hide",
                 reason: "Under investigation",
+                // Match manual decisions: timestamp the change under the user
+                // lock rather than the submission transaction's BEGIN time.
+                createdAt: sql`clock_timestamp()`,
               });
             }
           }

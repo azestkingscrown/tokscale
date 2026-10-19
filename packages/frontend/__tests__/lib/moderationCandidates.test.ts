@@ -240,6 +240,7 @@ describe("applyModerationAction - admin override protection integration", () => 
       actorUsername: "admin_lead",
       action: "unhide",
       reason: "Restored after review",
+      createdAt: expect.any(Object),
     });
 
     // In Phase 2 admin override check:
@@ -309,6 +310,7 @@ describe("applyModerationAction - admin override protection integration", () => 
       actorUsername: "mod_lead",
       action: "hide",
       reason: "Abuse",
+      createdAt: expect.any(Object),
     });
   });
 

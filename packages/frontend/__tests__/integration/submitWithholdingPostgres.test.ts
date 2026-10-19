@@ -1,4 +1,5 @@
 import { createHash, randomInt, randomUUID } from "node:crypto";
+import { sql as drizzleSql } from "drizzle-orm";
 import type { Sql, TransactionSql } from "postgres";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SubmissionData } from "@/lib/validation/submission";
@@ -20,8 +21,9 @@ vi.mock("@/lib/groups/cache", () => ({ revalidateUserGroupLeaderboards: vi.fn() 
 vi.mock("@/lib/leaderboard/getLeaderboard", () => ({ getLeaderboardData: vi.fn(async () => ({})) }));
 
 import { POST } from "@/app/api/submit/route";
+import { db } from "@/lib/db";
 import { validateSubmission } from "@/lib/validation/submission";
-import { applyModerationAction } from "@/lib/moderation/actions";
+import { applyModerationAction, getModerationHistory } from "@/lib/moderation/actions";
 import { getModerationCandidates } from "@/lib/moderation/candidates";
 
 const integrationEnabled = process.env.SUBMISSION_WITHHOLDING_DB_INTEGRATION === "1";
@@ -168,6 +170,49 @@ describeWithPostgres("submission withholding PostgreSQL integration", () => {
     expect(await hidden(a)).toBe(false);
     const sql = database();
     expect(await sql`SELECT id FROM moderation_actions WHERE target_user_id = ${a.id}`).toHaveLength(2);
+  });
+
+  it("orders decisions by the state change when an earlier administrator transaction is delayed", async () => {
+    const a = await account();
+    const admin = await account();
+    let started!: () => void;
+    let release!: () => void;
+    const startedPromise = new Promise<void>(r => { started = r; });
+    const releasePromise = new Promise<void>(r => { release = r; });
+    const transaction = db.transaction.bind(db);
+    // Model a scheduling delay after BEGIN. The production helper still
+    // performs every moderation query and holds the real user row lock.
+    vi.spyOn(db, "transaction").mockImplementationOnce((callback, config) =>
+      transaction(async tx => {
+        await tx.execute(drizzleSql`SELECT transaction_timestamp()`);
+        started();
+        await releasePromise;
+        return callback(tx);
+      }, config)
+    );
+    const restore = applyModerationAction({
+      target: { id: a.id, username: a.username, leaderboardHidden: true },
+      actorUserId: admin.id, actorUsername: admin.username,
+      action: "unhide", reason: "Restored after review",
+    });
+    await startedPromise;
+    const data = payload([client("claude", "claude-sonnet-4", tokens(1000, 20_000_000_000), 1000)]);
+    try {
+      await submit(a, data);
+      expect(await hidden(a)).toBe(true);
+    } finally {
+      release();
+      expect((await restore).changed).toBe(true);
+    }
+    expect(await hidden(a)).toBe(false);
+    const history = await getModerationHistory(a.id);
+    expect(history.map(row => row.action)).toEqual(["unhide", "hide"]);
+    const candidate = (await getModerationCandidates()).find(row => row.userId === a.id);
+    expect(candidate?.latestActorUsername).toBe(admin.username);
+    expect(candidate?.latestAction).toBe("unhide");
+    await submit(a, data);
+    expect(await hidden(a)).toBe(false);
+    expect(await getModerationHistory(a.id)).toHaveLength(2);
   });
 
   it("disables evaluation with the kill switch", async () => {
