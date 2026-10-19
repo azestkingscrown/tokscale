@@ -267,6 +267,73 @@ describeWithPostgres("submission withholding PostgreSQL integration", () => {
     expect(await signals(a)).not.toContain("impliedRate");
   });
 
+  it.each([
+    { name: "historical scalar-only cost floor", nestedCost: 0, modelId: null },
+    { name: "partial legacy model map", nestedCost: 10, modelId: "premium-tool-call" },
+  ])("excludes the tokenless Cursor remainder from a $name", async ({ nestedCost, modelId }) => {
+    const a = await account();
+    await submit(a, payload([
+      client("cursor", "premium-tool-call", tokens(), 100),
+      client("claude", "claude-sonnet-4", tokens(500, 500), 0.005),
+    ]));
+    const sql = database();
+    // Older cost floors raised only client.cost, leaving nested costs lower.
+    await sql`UPDATE daily_breakdown SET source_breakdown = jsonb_set(
+      source_breakdown, '{cursor,models,premium-tool-call,cost}', ${JSON.stringify(nestedCost)}::jsonb)
+      WHERE submission_id = (SELECT id FROM submissions WHERE user_id = ${a.id})`;
+    if (modelId) {
+      await sql`UPDATE daily_breakdown SET source_breakdown = jsonb_set(
+        source_breakdown, '{cursor,modelId}', ${JSON.stringify(modelId)}::jsonb)
+        WHERE submission_id = (SELECT id FROM submissions WHERE user_id = ${a.id})`;
+    }
+    expect(await hidden(a)).toBe(false);
+    expect(await signals(a)).not.toContain("impliedRate");
+  });
+
+  it("assigns a tokenless legacy cost remainder beside fully represented Cursor tokens", async () => {
+    const a = await account();
+    await submit(a, payload([
+      client("cursor", "premium-tool-call", tokens(), 100),
+      client("cursor", "claude-sonnet-4", tokens(500, 500), 0.005),
+    ]));
+    const sql = database();
+    await sql`UPDATE daily_breakdown SET source_breakdown = jsonb_set(
+      jsonb_set(source_breakdown, '{cursor,models,premium-tool-call,cost}', '10'::jsonb),
+      '{cursor,modelId}', '"premium-tool-call"'::jsonb)
+      WHERE submission_id = (SELECT id FROM submissions WHERE user_id = ${a.id})`;
+    expect(await signals(a)).not.toContain("impliedRate");
+  });
+
+  it.each([
+    { namedCost: 0.005, expectedSignal: false },
+    { namedCost: 25, expectedSignal: true },
+  ])("does not price an unnamed Cursor cost remainder but preserves named cost $namedCost", async ({ namedCost, expectedSignal }) => {
+    const a = await account();
+    await submit(a, payload([
+      client("cursor", "premium-tool-call", tokens(), 100),
+      client("cursor", "claude-sonnet-4", tokens(500, 500), namedCost),
+    ]));
+    const sql = database();
+    await sql`UPDATE daily_breakdown SET source_breakdown = jsonb_set(
+      source_breakdown, '{cursor,models,premium-tool-call,cost}', '10'::jsonb)
+      WHERE submission_id = (SELECT id FROM submissions WHERE user_id = ${a.id})`;
+    expect((await signals(a)).includes("impliedRate")).toBe(expectedSignal);
+  });
+
+  it("does not exempt a named Cursor cost remainder that also carries tokens", async () => {
+    const a = await account();
+    await submit(a, payload([client("cursor", "premium-tool-call", tokens(500, 500), 100)]));
+    const sql = database();
+    // The model map no longer covers the scalar's tokens or most of its cost.
+    // modelsForHighWater assigns both remainders to the explicit modelId.
+    await sql`UPDATE daily_breakdown SET source_breakdown = jsonb_set(
+      source_breakdown, '{cursor}', jsonb_set(source_breakdown->'cursor',
+        '{models,premium-tool-call}', '{"tokens":0,"input":0,"output":0,"cost":10}'::jsonb)
+        || '{"modelId":"premium-tool-call"}'::jsonb)
+      WHERE submission_id = (SELECT id FROM submissions WHERE user_id = ${a.id})`;
+    expect(await signals(a)).toContain("impliedRate");
+  });
+
   it("excludes tokenless costs when Cursor also has token-bearing models that day", async () => {
     const a = await account();
     await submit(a, payload([
