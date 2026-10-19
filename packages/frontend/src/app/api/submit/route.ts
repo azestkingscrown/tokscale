@@ -11,8 +11,8 @@ import {
 } from "@/lib/validation/submission";
 import {
   evaluateSubmissionForWithholding,
-  type WithholdingDailyContribution,
-  type WithholdingClientContribution,
+  getSubmissionWithholdingMode,
+  getWithholdingUsageTotals,
 } from "@/lib/moderation/withholding";
 import { authenticatePersonalToken } from "@/lib/auth/personalTokens";
 import { getBearerToken } from "../../../lib/auth/bearerToken";
@@ -588,6 +588,7 @@ export async function POST(request: Request) {
       data.contributions,
       isBackfill ? "backfill" : "cli"
     );
+    const withholdingMode = getSubmissionWithholdingMode(process.env.ENABLE_SUBMISSION_AUTOHIDE);
     const result = await db.transaction(async (tx) => {
       await tx
         .update(apiTokens)
@@ -1443,6 +1444,8 @@ export async function POST(request: Request) {
       const allDays = await tx
         .select({
           date: dailyBreakdown.date,
+          tokens: dailyBreakdown.tokens,
+          outputTokens: dailyBreakdown.outputTokens,
           sourceBreakdown: dailyBreakdown.sourceBreakdown,
         })
         .from(dailyBreakdown)
@@ -1450,7 +1453,6 @@ export async function POST(request: Request) {
 
       const allClients = new Set<string>();
       const allModels = new Set<string>();
-      const mergedModelTokens: Record<string, number> = {};
       let totalCacheRead = 0;
       let totalCacheCreation = 0;
       let totalReasoning = 0;
@@ -1461,21 +1463,13 @@ export async function POST(request: Request) {
             const clientName = rawClientName === "kilocode" ? "kilo" : rawClientName;
             allClients.add(clientName);
             const cd = clientData as ClientBreakdownData;
-            let nestedTokensSum = 0;
             if (cd.models) {
-              for (const [modelId, mData] of Object.entries(cd.models)) {
+              for (const modelId of Object.keys(cd.models)) {
                 allModels.add(modelId);
-                const tokens = typeof mData === "number" ? mData : (mData?.tokens ?? 0);
-                nestedTokensSum += tokens;
-                mergedModelTokens[modelId] = (mergedModelTokens[modelId] ?? 0) + tokens;
               }
             }
             if (cd.modelId) {
               allModels.add(cd.modelId);
-              const remainderTokens = Math.max(0, (cd.tokens ?? 0) - nestedTokensSum);
-              if (remainderTokens > 0 || !(cd.modelId in mergedModelTokens)) {
-                mergedModelTokens[cd.modelId] = (mergedModelTokens[cd.modelId] ?? 0) + remainderTokens;
-              }
             }
             totalCacheRead += cd.cacheRead || 0;
             totalCacheCreation += cd.cacheWrite || 0;
@@ -1553,9 +1547,14 @@ export async function POST(request: Request) {
         })
         .where(eq(submissions.id, submissionId));
 
-      // Automated leaderboard withholding (Issue #1473)
+      // Only final ledger volume can change account state. The default mode
+      // observes decisions without acquiring a user lock or hiding anyone.
+      const withholdingUsage = withholdingMode === "off" ? null : getWithholdingUsageTotals(allDays);
+      const withholdingResult = withholdingUsage
+        ? evaluateSubmissionForWithholding(withholdingUsage)
+        : null;
       let autoWithheld = false;
-      if (process.env.ENABLE_SUBMISSION_AUTOHIDE !== "0" && users && moderationActions) {
+      if (withholdingMode === "enforce" && withholdingResult?.shouldWithhold) {
         const [currentUser] = await tx
           .select({ leaderboardHidden: users.leaderboardHidden })
           .from(users)
@@ -1563,7 +1562,7 @@ export async function POST(request: Request) {
           .for("update")
           .limit(1);
 
-        if (!currentUser?.leaderboardHidden) {
+        if (currentUser && !currentUser.leaderboardHidden) {
           const [latestModAction] = await tx
             .select({
               action: moderationActions.action,
@@ -1581,154 +1580,39 @@ export async function POST(request: Request) {
             modActor !== "system";
 
           if (!isAdminApproved) {
-            const dailyByDate = new Map<string, WithholdingDailyContribution>();
-            const undatedContributions: WithholdingDailyContribution[] = [];
+            const updatedRows = await tx
+              .update(users)
+              .set({ leaderboardHidden: true, updatedAt: new Date() })
+              .where(
+                and(
+                  eq(users.id, tokenRecord.userId),
+                  eq(users.leaderboardHidden, false),
+                  sql`NOT EXISTS (
+                    SELECT 1 FROM (
+                      SELECT action, actor_username
+                      FROM ${moderationActions}
+                      WHERE ${moderationActions.targetUserId} = ${tokenRecord.userId}
+                      ORDER BY ${moderationActions.createdAt} DESC, ${moderationActions.id} DESC
+                      LIMIT 1
+                    ) AS latest_mod
+                    WHERE latest_mod.action = 'unhide'
+                      AND LENGTH(TRIM(COALESCE(latest_mod.actor_username, ''))) > 0
+                      AND LOWER(TRIM(latest_mod.actor_username)) <> 'system'
+                  )`,
+                ),
+              )
+              .returning({ id: users.id });
 
-            for (const day of allDays) {
-              const clientsList: WithholdingClientContribution[] = [];
-              let dayOutput = 0;
-              let dayTokens = 0;
-              let dayCost = 0;
-              let dayInput = 0;
-              if (day.sourceBreakdown) {
-                for (const [rawClientName, clientData] of Object.entries(day.sourceBreakdown)) {
-                  const clientName = rawClientName === "kilocode" ? "kilo" : rawClientName;
-                  const cd = clientData as ClientBreakdownData;
-                  clientsList.push({
-                    client: clientName,
-                    ...cd,
-                  });
-                  dayTokens += typeof cd.tokens === "number" ? cd.tokens : 0;
-                  dayCost += typeof cd.cost === "number" ? cd.cost : 0;
-                  dayOutput += typeof cd.output === "number" ? cd.output : 0;
-                  dayInput += typeof cd.input === "number" ? cd.input : 0;
-                }
-              }
-
-              const rawDayDate =
-                (day as { dayDate?: unknown; date?: unknown }).dayDate ??
-                (day as { date?: unknown }).date;
-              const dayDate =
-                typeof rawDayDate === "string" && rawDayDate.trim()
-                  ? rawDayDate.trim()
-                  : undefined;
-
-              if (dayDate) {
-                const existing = dailyByDate.get(dayDate);
-                if (existing) {
-                  const prevTokens = Number(existing.totals?.tokens ?? 0);
-                  const prevCost = Number(existing.totals?.cost ?? 0);
-                  const prevInput = Number(existing.tokenBreakdown?.input ?? 0);
-                  const prevOutput = Number(existing.tokenBreakdown?.output ?? 0);
-                  const nextCost = prevCost + dayCost;
-                  existing.totals = {
-                    tokens: prevTokens + dayTokens,
-                    cost: nextCost > 0 ? String(nextCost) : undefined,
-                  };
-                  existing.tokenBreakdown = {
-                    input: prevInput + dayInput,
-                    output: prevOutput + dayOutput,
-                  };
-                  existing.clients = [...(existing.clients ?? []), ...clientsList];
-                } else {
-                  dailyByDate.set(dayDate, {
-                    date: dayDate,
-                    totals: {
-                      tokens: dayTokens,
-                      cost: dayCost > 0 ? String(dayCost) : undefined,
-                    },
-                    tokenBreakdown: {
-                      input: dayInput,
-                      output: dayOutput,
-                    },
-                    clients: clientsList,
-                  });
-                }
-              } else {
-                undatedContributions.push({
-                  totals: {
-                    tokens: dayTokens,
-                    cost: dayCost > 0 ? String(dayCost) : undefined,
-                  },
-                  tokenBreakdown: {
-                    input: dayInput,
-                    output: dayOutput,
-                  },
-                  clients: clientsList,
-                });
-              }
-            }
-
-            const dailyContributions: WithholdingDailyContribution[] = [
-              ...dailyByDate.values(),
-              ...undatedContributions,
-            ];
-
-            const withholdingResult = evaluateSubmissionForWithholding({
-              totalTokens: aggregates.totalTokens,
-              totalCost: aggregates.totalCost,
-              outputTokens: aggregates.outputTokens,
-              models: Array.from(allModels),
-              modelTokens: mergedModelTokens,
-              contributions: dailyContributions,
-              timeMetrics: {
-                totalActiveTimeMs: mergedActiveTimeMs,
-                longestContinuousMs: mergedLongestContinuousMs,
-                maxConcurrentSessions: mergedMaxConcurrentSessions,
-                sessionCount: mergedSessionCount,
-              },
-            });
-
-            if (withholdingResult.shouldWithhold) {
-              const updateQuery = tx
-                .update(users)
-                .set({
-                  leaderboardHidden: true,
-                  updatedAt: new Date(),
-                })
-                .where(
-                  and(
-                    eq(users.id, tokenRecord.userId),
-                    eq(users.leaderboardHidden, false),
-                    sql`NOT EXISTS (
-                      SELECT 1 FROM (
-                        SELECT action, actor_username
-                        FROM ${moderationActions}
-                        WHERE ${moderationActions.targetUserId} = ${tokenRecord.userId}
-                        ORDER BY ${moderationActions.createdAt} DESC, ${moderationActions.id} DESC
-                        LIMIT 1
-                      ) AS latest_mod
-                      WHERE latest_mod.action = 'unhide'
-                        AND LENGTH(TRIM(COALESCE(latest_mod.actor_username, ''))) > 0
-                        AND LOWER(TRIM(latest_mod.actor_username)) <> 'system'
-                    )`,
-                  ),
-                );
-
-              const updatedRows =
-                typeof (updateQuery as { returning?: unknown })?.returning === "function"
-                  ? await (
-                      updateQuery as unknown as {
-                        returning: (cols: { id: unknown }) => Promise<Array<{ id: string }>>;
-                      }
-                    ).returning({ id: users.id })
-                  : (await updateQuery, [{ id: tokenRecord.userId }]);
-
-              if (updatedRows.length > 0) {
-                autoWithheld = true;
-                await tx.insert(moderationActions).values({
-                  targetUserId: tokenRecord.userId,
-                  targetUsername: tokenRecord.username,
-                  actorUserId: null,
-                  actorUsername: "system",
-                  action: "hide",
-                  reason: "Under investigation",
-                });
-
-                console.warn(
-                  `[moderation] Auto-withheld user ${tokenRecord.username} (${tokenRecord.userId}): ${withholdingResult.reason}`
-                );
-              }
+            if (updatedRows.length > 0) {
+              autoWithheld = true;
+              await tx.insert(moderationActions).values({
+                targetUserId: tokenRecord.userId,
+                targetUsername: tokenRecord.username,
+                actorUserId: null,
+                actorUsername: "system",
+                action: "hide",
+                reason: "Under investigation",
+              });
             }
           }
         }
@@ -1752,6 +1636,8 @@ export async function POST(request: Request) {
         submissionId,
         isNewSubmission,
         autoWithheld,
+        withholdingResult,
+        withholdingUsage,
         metrics: {
           totalTokens:
             aggregates.totalTokens >= 9007199254740991
@@ -1767,6 +1653,20 @@ export async function POST(request: Request) {
         },
       };
     });
+
+    // Log after commit so failed submissions never look like accepted
+    // observations. Include clean decisions to preserve the denominator.
+    if (result.withholdingResult) {
+      console.warn(`[moderation] ${JSON.stringify({
+        event: "submission_withholding_evaluated",
+        ruleVersion: 1,
+        mode: withholdingMode,
+        userId: tokenRecord.userId,
+        ...result.withholdingResult,
+        usage: result.withholdingUsage,
+        applied: result.autoWithheld,
+      })}`);
+    }
 
     // Phase 1 / 1.5 census. Deliberately after the transaction commits, and
     // deliberately unable to affect the response below.

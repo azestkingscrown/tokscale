@@ -3,6 +3,7 @@ import { db } from "@/lib/db";
 import {
   DAILY_MISMATCH_THRESHOLD,
   MAX_IMPLIED_RATE,
+  MIN_REVIEW_COST,
   MEDIAN_RATIO_THRESHOLD,
   SLOP_MODEL_REGEX,
   UNNAMED_MODEL_REGEX,
@@ -10,9 +11,16 @@ import {
   aggregateUnknowableStats,
   rankCandidates,
   SITE_SHARE_THRESHOLD,
+  REVIEW_OUTPUT_TOKEN_FLOOR,
+  REVIEW_MAX_OUTPUT_TOKENS_PER_ACTIVE_SECOND,
   type CandidateRow,
   type ScoredCandidate,
 } from "./heuristics";
+import {
+  WITHHOLDING_MAX_DAILY_OUTPUT_TOKENS,
+  WITHHOLDING_MAX_DAILY_TOTAL_TOKENS,
+  WITHHOLDING_MAX_TOTAL_TOKENS,
+} from "./withholding";
 
 /**
  * How close two token totals must be to count as "the same data in two
@@ -42,6 +50,11 @@ interface CandidateDbRow extends Record<string, unknown> {
   latest_actor_username?: string | null;
   latest_action?: string | null;
   latest_action_reason?: string | null;
+  daily_max_tokens?: number | string | null;
+  daily_max_output_tokens?: number | string | null;
+  output_tokens?: number | string | null;
+  total_active_time_ms?: number | string | null;
+  token_attributed_cost?: number | string | null;
 }
 
 /**
@@ -80,8 +93,8 @@ function toBigInt(value: number | string | null | undefined): bigint {
  * Builds the review queue: every user with at least one suspicion signal, plus
  * everyone currently hidden so past decisions stay visible and reversible.
  *
- * Read-only. Nothing here changes state — hiding is always an explicit,
- * human-initiated action.
+ * Read-only. Includes volume-limit observations even while automated
+ * withholding is disabled, so an operator can review before enabling it.
  */
 export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
   const result = await db.execute<CandidateDbRow>(sql`
@@ -94,6 +107,8 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         s.id AS submission_id,
         s.total_tokens,
         CAST(s.total_cost AS DECIMAL(18,4)) AS total_cost,
+        s.output_tokens,
+        s.total_active_time_ms,
         s.submit_count,
         s.has_backfill,
         -- Pre-filtered here rather than shipping the whole array: the busiest
@@ -109,10 +124,12 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
       FROM users u
       JOIN submissions s ON s.user_id = u.id
     ),
-    daily AS (
+    daily_by_date AS (
       SELECT
         d.submission_id,
-        SUM(d.tokens) AS daily_tokens,
+        d.date,
+        SUM(d.tokens) AS tokens,
+        SUM(d.output_tokens) AS output_tokens,
         -- COALESCE rather than a bare comparison: jsonb_typeof(NULL) is NULL
         -- and BOOL_AND skips NULL inputs, so one legacy row with no breakdown
         -- next to one attributed row would still report "all attributed".
@@ -120,6 +137,46 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
           COALESCE(jsonb_typeof(d.source_breakdown) = 'object', false)
         ) AS every_day_attributed
       FROM daily_breakdown d
+      GROUP BY d.submission_id, d.date
+    ),
+    daily AS (
+      SELECT submission_id, SUM(tokens) AS daily_tokens,
+        MAX(tokens) AS daily_max_tokens,
+        MAX(output_tokens) AS daily_max_output_tokens,
+        BOOL_AND(every_day_attributed) AS every_day_attributed
+      FROM daily_by_date
+      GROUP BY submission_id
+    ),
+    -- Cursor's premium-tool-call is a per-invocation charge with no token
+    -- attribution. Match the validation carve-out for both stored layouts.
+    cursor_legacy_cost AS (
+      SELECT d.submission_id,
+        SUM(LEAST(
+          COALESCE((c.entry->>'cost')::numeric, 0),
+          CASE
+            WHEN jsonb_typeof(c.entry->'models'->'premium-tool-call') = 'object' THEN
+              CASE WHEN COALESCE((m.entry->>'tokens')::numeric, 0) = 0
+                AND COALESCE((m.entry->>'input')::numeric, 0) = 0
+                AND COALESCE((m.entry->>'output')::numeric, 0) = 0
+                AND COALESCE((m.entry->>'cacheRead')::numeric, 0) = 0
+                AND COALESCE((m.entry->>'cacheWrite')::numeric, 0) = 0
+                AND COALESCE((m.entry->>'reasoning')::numeric, 0) = 0
+              THEN COALESCE((m.entry->>'cost')::numeric, 0) ELSE 0 END
+            WHEN c.entry->>'modelId' = 'premium-tool-call'
+              AND COALESCE((c.entry->>'tokens')::numeric, 0) = 0
+              AND COALESCE((c.entry->>'input')::numeric, 0) = 0
+              AND COALESCE((c.entry->>'output')::numeric, 0) = 0
+              AND COALESCE((c.entry->>'cacheRead')::numeric, 0) = 0
+              AND COALESCE((c.entry->>'cacheWrite')::numeric, 0) = 0
+              AND COALESCE((c.entry->>'reasoning')::numeric, 0) = 0
+            THEN COALESCE((c.entry->>'cost')::numeric, 0)
+            ELSE 0
+          END
+        )) AS legacy_cost
+      FROM daily_breakdown d
+      CROSS JOIN LATERAL (SELECT d.source_breakdown->'cursor' AS entry) c
+      CROSS JOIN LATERAL (SELECT c.entry->'models'->'premium-tool-call' AS entry) m
+      WHERE jsonb_typeof(c.entry) = 'object'
       GROUP BY d.submission_id
     ),
     -- Scoped to accounts that actually have a matching name: the per-model
@@ -298,6 +355,9 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
       SELECT
         p.*,
         COALESCE(dl.daily_tokens, 0) AS daily_tokens,
+        COALESCE(dl.daily_max_tokens, 0) AS daily_max_tokens,
+        COALESCE(dl.daily_max_output_tokens, 0) AS daily_max_output_tokens,
+        GREATEST(p.total_cost - COALESCE(clc.legacy_cost, 0), 0) AS token_attributed_cost,
         -- A share is only meaningful when every one of this account's tokens
         -- is attributed to a named model. Tokens nobody claims — a scalar
         -- remainder with no modelId, or a cell keyed 'unknown' or '*' — could
@@ -346,6 +406,7 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         lm.reason AS latest_action_reason
       FROM per_user p
       LEFT JOIN daily dl ON dl.submission_id = p.submission_id
+      LEFT JOIN cursor_legacy_cost clc ON clc.submission_id = p.submission_id
       LEFT JOIN slop_usage su ON su.submission_id = p.submission_id
       LEFT JOIN latest_mod lm ON lm.target_user_id = p.user_id
       CROSS JOIN site
@@ -354,6 +415,14 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
       SELECT *
       FROM enriched
       WHERE leaderboard_hidden = true
+        OR daily_max_output_tokens > ${WITHHOLDING_MAX_DAILY_OUTPUT_TOKENS}
+        OR daily_max_tokens > ${WITHHOLDING_MAX_DAILY_TOTAL_TOKENS}
+        OR daily_tokens >= ${WITHHOLDING_MAX_TOTAL_TOKENS}
+        OR (
+          output_tokens >= ${REVIEW_OUTPUT_TOKEN_FLOOR}
+          AND total_active_time_ms > 0
+          AND output_tokens::numeric / NULLIF(total_active_time_ms::numeric / 1000, 0) > ${REVIEW_MAX_OUTPUT_TOKENS_PER_ACTIVE_SECOND}
+        )
         OR (site_tokens > 0 AND total_tokens::numeric / site_tokens >= ${SITE_SHARE_THRESHOLD})
         OR (median_tokens > 0 AND total_tokens::numeric / median_tokens >= ${MEDIAN_RATIO_THRESHOLD})
         OR near_duplicate_count > 0
@@ -361,12 +430,15 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         OR (daily_tokens > 0 AND total_tokens::numeric / daily_tokens >= ${DAILY_MISMATCH_THRESHOLD})
         OR (
           total_tokens > 0
-          AND total_cost / total_tokens::numeric > ${MAX_IMPLIED_RATE}
+          AND token_attributed_cost >= ${MIN_REVIEW_COST}
+          AND token_attributed_cost / total_tokens::numeric > ${MAX_IMPLIED_RATE}
         )
     )
     SELECT
       user_id, username, avatar_url, leaderboard_hidden, total_tokens,
       total_cost, submit_count, has_backfill, daily_tokens,
+      daily_max_tokens, daily_max_output_tokens, output_tokens,
+      total_active_time_ms, token_attributed_cost,
       near_duplicate_count, slop_models, slop_tokens,
       has_over_nested_entry, every_day_attributed, attributed_tokens,
       site_tokens, median_tokens,
@@ -386,6 +458,11 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
     submitCount: toNumber(row.submit_count),
     hasBackfill: row.has_backfill === true,
     dailyTokens: toNumber(row.daily_tokens),
+    dailyMaxTokens: toNumber(row.daily_max_tokens),
+    dailyMaxOutputTokens: toNumber(row.daily_max_output_tokens),
+    outputTokens: toNumber(row.output_tokens),
+    totalActiveTimeMs: toNumber(row.total_active_time_ms),
+    tokenAttributedCost: toNumber(row.token_attributed_cost ?? row.total_cost),
     nearDuplicateCount: toNumber(row.near_duplicate_count),
     slopModels: Array.isArray(row.slop_models) ? row.slop_models : [],
     slopTokens: row.slop_tokens == null ? null : toNumber(row.slop_tokens),
