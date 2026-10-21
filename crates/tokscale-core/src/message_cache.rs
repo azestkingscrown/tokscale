@@ -1018,10 +1018,14 @@ struct LegacyCodexStateV14 {
 }
 impl From<LegacyCodexStateV14> for CodexParseState {
     fn from(state: LegacyCodexStateV14) -> Self {
+        let has_own_turn_context =
+            state.current_model.is_some() || !state.turn_coverage.turn_ids.is_empty();
         Self {
             has_own_activity: state.has_own_activity,
             has_supported_usage: state.has_supported_usage,
             has_own_synthetic_activity: state.has_own_synthetic_activity,
+            has_entered_review_mode: false,
+            has_own_turn_context,
             current_model: state.current_model,
             thread_service_tier: state.thread_service_tier,
             request_service_tier: state.request_service_tier,
@@ -1159,10 +1163,14 @@ struct LegacyCodexStateV15 {
 }
 impl From<LegacyCodexStateV15> for CodexParseState {
     fn from(state: LegacyCodexStateV15) -> Self {
+        let has_own_turn_context =
+            state.current_model.is_some() || !state.turn_coverage.turn_ids.is_empty();
         Self {
             has_own_activity: state.has_own_activity,
             has_supported_usage: state.has_supported_usage,
             has_own_synthetic_activity: state.has_own_synthetic_activity,
+            has_entered_review_mode: false,
+            has_own_turn_context,
             current_model: state.current_model,
             thread_service_tier: state.thread_service_tier,
             request_service_tier: state.request_service_tier,
@@ -1253,6 +1261,159 @@ impl From<LegacyCodexIncrementalV15> for CodexIncrementalCache {
 }
 #[cfg(test)]
 impl From<CodexIncrementalCache> for LegacyCodexIncrementalV15 {
+    fn from(cache: CodexIncrementalCache) -> Self {
+        Self {
+            state: cache.state.into(),
+            consumed_offset: cache.consumed_offset,
+            ends_with_newline: cache.ends_with_newline,
+            prefix_hash: cache.prefix_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyCodexStateV19 {
+    has_own_activity: bool,
+    has_supported_usage: bool,
+    has_own_synthetic_activity: bool,
+    current_model: Option<String>,
+    thread_service_tier: Option<String>,
+    request_service_tier: Option<String>,
+    current_turn_start_ms: Option<i64>,
+    last_accepted_token_timestamp_ms: Option<i64>,
+    previous_totals: Option<crate::sessions::codex::CodexTotals>,
+    session_is_headless: bool,
+    session_is_subagent: bool,
+    session_is_guardian: bool,
+    session_id_from_meta: Option<String>,
+    session_forked_from_id: Option<String>,
+    forked_child_session_id: Option<String>,
+    forked_child_replay_session_id: Option<String>,
+    session_provider: Option<String>,
+    session_agent: Option<String>,
+    session_workspace_key: Option<String>,
+    session_workspace_label: Option<String>,
+    forked_child_waiting_for_turn_context: bool,
+    forked_child_inherited_baseline: Option<crate::sessions::codex::CodexTotals>,
+    forked_child_inherited_reported_total: Option<i64>,
+    pending_turn_start: bool,
+    forked_child_task_started_turn_ids: std::collections::HashSet<String>,
+    forked_child_is_user_fork: bool,
+    session_owned_by_openclaw: bool,
+    current_turn_id: Option<String>,
+    turn_id_announced_by_task_started: bool,
+    usage_event_ordinal: u64,
+    turn_coverage: crate::sessions::codex::CodexTurnCoverage,
+    pending_usage_record: Option<crate::sessions::codex::CodexPendingUsageRecord>,
+    settled_usage_records: std::collections::VecDeque<crate::sessions::codex::CodexTotals>,
+}
+
+impl From<LegacyCodexStateV19> for CodexParseState {
+    fn from(state: LegacyCodexStateV19) -> Self {
+        let has_own_turn_context =
+            state.current_model.is_some() || !state.turn_coverage.turn_ids.is_empty();
+        Self {
+            has_own_activity: state.has_own_activity,
+            has_supported_usage: state.has_supported_usage,
+            has_own_synthetic_activity: state.has_own_synthetic_activity,
+            current_model: state.current_model,
+            thread_service_tier: state.thread_service_tier,
+            request_service_tier: state.request_service_tier,
+            current_turn_start_ms: state.current_turn_start_ms,
+            last_accepted_token_timestamp_ms: state.last_accepted_token_timestamp_ms,
+            previous_totals: state.previous_totals,
+            session_is_headless: state.session_is_headless,
+            session_is_subagent: state.session_is_subagent,
+            session_is_guardian: state.session_is_guardian,
+            session_id_from_meta: state.session_id_from_meta,
+            session_forked_from_id: state.session_forked_from_id,
+            forked_child_session_id: state.forked_child_session_id,
+            forked_child_replay_session_id: state.forked_child_replay_session_id,
+            session_provider: state.session_provider,
+            session_agent: state.session_agent,
+            session_workspace_key: state.session_workspace_key,
+            session_workspace_label: state.session_workspace_label,
+            forked_child_waiting_for_turn_context: state.forked_child_waiting_for_turn_context,
+            forked_child_inherited_baseline: state.forked_child_inherited_baseline,
+            forked_child_inherited_reported_total: state.forked_child_inherited_reported_total,
+            pending_turn_start: state.pending_turn_start,
+            forked_child_task_started_turn_ids: state.forked_child_task_started_turn_ids,
+            forked_child_is_user_fork: state.forked_child_is_user_fork,
+            session_owned_by_openclaw: state.session_owned_by_openclaw,
+            current_turn_id: state.current_turn_id,
+            turn_id_announced_by_task_started: state.turn_id_announced_by_task_started,
+            usage_event_ordinal: state.usage_event_ordinal,
+            turn_coverage: state.turn_coverage,
+            pending_usage_record: state.pending_usage_record,
+            settled_usage_records: state.settled_usage_records,
+            has_entered_review_mode: false,
+            has_own_turn_context,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyCodexIncrementalV19 {
+    state: LegacyCodexStateV19,
+    consumed_offset: u64,
+    ends_with_newline: bool,
+    prefix_hash: [u8; 32],
+}
+
+impl From<LegacyCodexIncrementalV19> for CodexIncrementalCache {
+    fn from(cache: LegacyCodexIncrementalV19) -> Self {
+        Self {
+            state: cache.state.into(),
+            consumed_offset: cache.consumed_offset,
+            ends_with_newline: cache.ends_with_newline,
+            prefix_hash: cache.prefix_hash,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<CodexParseState> for LegacyCodexStateV19 {
+    fn from(state: CodexParseState) -> Self {
+        Self {
+            has_own_activity: state.has_own_activity,
+            has_supported_usage: state.has_supported_usage,
+            has_own_synthetic_activity: state.has_own_synthetic_activity,
+            current_model: state.current_model,
+            thread_service_tier: state.thread_service_tier,
+            request_service_tier: state.request_service_tier,
+            current_turn_start_ms: state.current_turn_start_ms,
+            last_accepted_token_timestamp_ms: state.last_accepted_token_timestamp_ms,
+            previous_totals: state.previous_totals,
+            session_is_headless: state.session_is_headless,
+            session_is_subagent: state.session_is_subagent,
+            session_is_guardian: state.session_is_guardian,
+            session_id_from_meta: state.session_id_from_meta,
+            session_forked_from_id: state.session_forked_from_id,
+            forked_child_session_id: state.forked_child_session_id,
+            forked_child_replay_session_id: state.forked_child_replay_session_id,
+            session_provider: state.session_provider,
+            session_agent: state.session_agent,
+            session_workspace_key: state.session_workspace_key,
+            session_workspace_label: state.session_workspace_label,
+            forked_child_waiting_for_turn_context: state.forked_child_waiting_for_turn_context,
+            forked_child_inherited_baseline: state.forked_child_inherited_baseline,
+            forked_child_inherited_reported_total: state.forked_child_inherited_reported_total,
+            pending_turn_start: state.pending_turn_start,
+            forked_child_task_started_turn_ids: state.forked_child_task_started_turn_ids,
+            forked_child_is_user_fork: state.forked_child_is_user_fork,
+            session_owned_by_openclaw: state.session_owned_by_openclaw,
+            current_turn_id: state.current_turn_id,
+            turn_id_announced_by_task_started: state.turn_id_announced_by_task_started,
+            usage_event_ordinal: state.usage_event_ordinal,
+            turn_coverage: state.turn_coverage,
+            pending_usage_record: state.pending_usage_record,
+            settled_usage_records: state.settled_usage_records,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<CodexIncrementalCache> for LegacyCodexIncrementalV19 {
     fn from(cache: CodexIncrementalCache) -> Self {
         Self {
             state: cache.state.into(),
@@ -4303,9 +4464,10 @@ fn read_shard_with_limit_unchecked(
             // other parser version as stale.
             if identity.namespace == ClientId::Codex.as_str() {
                 match identity.parser_version {
-                    19 => {
-                        read_legacy_v10::<CodexIncrementalCache>(&envelope.payload, max_shard_bytes)
-                    }
+                    19 => read_legacy_v10::<LegacyCodexIncrementalV19>(
+                        &envelope.payload,
+                        max_shard_bytes,
+                    ),
                     15 => read_legacy_v10::<LegacyCodexIncrementalV15>(
                         &envelope.payload,
                         max_shard_bytes,
