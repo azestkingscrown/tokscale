@@ -118,8 +118,6 @@ pub struct CodexPayload {
     pub message: Option<String>,
     /// Turn-item payload (e.g. `EnteredReviewMode` on an `item_completed` event).
     pub item: Option<Value>,
-    /// Item type payload property when stamped directly on the payload.
-    pub item_type: Option<String>,
 }
 
 /// Lenient `Option<i64>` deserializer for `CodexPayload::started_at`. Coerces
@@ -1348,15 +1346,12 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                 // A `turn_context` starts a new turn, which ends only the
                 // request-scoped tier. The thread tier lives in its own slot,
                 // so a request-scoped record can never end it early.
-                if entry.entry_type == "turn_context"
-                    || payload.payload_type.as_deref() == Some("turn_context")
-                {
+                if entry.entry_type == "turn_context" {
                     state.has_own_turn_context = true;
                     state.request_service_tier = None;
                 }
                 if codex_entry_has_entered_review_mode(&entry.entry_type, &payload) {
                     state.has_entered_review_mode = true;
-                    handled = true;
                 }
                 let has_own_activity = match entry.entry_type.as_str() {
                     "response_item" => matches!(
@@ -2041,50 +2036,15 @@ fn codex_thread_is_subagent(thread_source: Option<&str>, source: Option<&Value>)
     thread_source == Some("subagent") || source.and_then(|source| source.get("subagent")).is_some()
 }
 
-fn is_entered_review_mode_str(s: &str) -> bool {
-    let s = s.trim();
-    if s.is_empty() {
-        return false;
-    }
-    s == "EnteredReviewMode"
-        || s == "entered_review_mode"
-        || s == "enteredReviewMode"
-        || s == "entered-review-mode"
-        || s.eq_ignore_ascii_case("enteredreviewmode")
-        || s.chars()
-            .filter(|c| *c != '_' && *c != '-' && *c != ' ')
-            .collect::<String>()
-            .eq_ignore_ascii_case("enteredreviewmode")
-}
-
 fn codex_entry_has_entered_review_mode(entry_type: &str, payload: &CodexPayload) -> bool {
-    fn item_value_has_entered_review_mode(item: &Value) -> bool {
-        match item {
-            Value::Object(map) => map
-                .get("type")
-                .or_else(|| map.get("item_type"))
-                .or_else(|| map.get("kind"))
-                .and_then(Value::as_str)
-                .is_some_and(is_entered_review_mode_str),
-            Value::String(s) => is_entered_review_mode_str(s),
-            Value::Array(items) => items.iter().any(item_value_has_entered_review_mode),
-            _ => false,
-        }
-    }
-
-    is_entered_review_mode_str(entry_type)
-        || payload
-            .payload_type
-            .as_deref()
-            .is_some_and(is_entered_review_mode_str)
-        || payload
-            .item_type
-            .as_deref()
-            .is_some_and(is_entered_review_mode_str)
-        || payload
+    entry_type == "event_msg"
+        && payload.payload_type.as_deref() == Some("item_completed")
+        && payload
             .item
             .as_ref()
-            .is_some_and(item_value_has_entered_review_mode)
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            == Some("EnteredReviewMode")
 }
 
 fn forked_from_id_from_source(source: Option<&Value>) -> Option<&str> {
@@ -2756,6 +2716,9 @@ fn codex_message_is_human_turn(message: Option<&str>) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) use tests::CODEX_REVIEW_PARENT_FIXTURE;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{aggregate_model_usage_entries, GroupBy};
@@ -2989,7 +2952,7 @@ mod tests {
         assert!(parsed.messages.is_empty());
     }
 
-    const CODEX_REVIEW_PARENT_FIXTURE: &str = concat!(
+    pub(crate) const CODEX_REVIEW_PARENT_FIXTURE: &str = concat!(
         r#"{"timestamp":"2026-09-01T10:00:00.100Z","type":"session_meta","payload":{"id":"00000000-0000-7000-8000-000000000001","timestamp":"2026-09-01T10:00:00.000Z","cwd":"/repo","originator":"codex_exec","cli_version":"0.154.0","source":"exec","thread_source":"user","model_provider":"openai"}}"#,
         "\n",
         r#"{"timestamp":"2026-09-01T10:00:00.100Z","type":"event_msg","payload":{"type":"item_completed","thread_id":"00000000-0000-7000-8000-000000000001","turn_id":"rollout-1","item":{"type":"EnteredReviewMode","id":"item-1","target":{"type":"baseBranch","branch":"main"},"user_facing_hint":"changes against 'main'"}}}"#,
@@ -3159,54 +3122,6 @@ mod tests {
         assert!(!parsed.state.has_entered_review_mode);
         assert!(!parsed.is_review_parent_rollout());
         assert!(parsed.is_missing_usage());
-    }
-
-    #[test]
-    fn codex_review_parent_supports_casing_and_item_type_variants() {
-        // Variant 1: kebab-case
-        let kebab = concat!(
-            r#"{"type":"session_meta","payload":{"id":"00000000-0000-7000-8000-000000000001","thread_source":"user"}}"#,
-            "\n",
-            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"entered-review-mode"}}}"#,
-            "\n",
-            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"No issues."}]}}"#,
-            "\n"
-        );
-        let file1 = create_test_file(kebab);
-        let parsed1 = parse_codex_file_incremental(file1.path(), 0, CodexParseState::default());
-        assert!(parsed1.state.has_entered_review_mode);
-        assert!(parsed1.is_review_parent_rollout());
-        assert!(!parsed1.is_missing_usage());
-
-        // Variant 2: payload-level item_type
-        let payload_item_type = concat!(
-            r#"{"type":"session_meta","payload":{"id":"00000000-0000-7000-8000-000000000001","thread_source":"user"}}"#,
-            "\n",
-            r#"{"type":"event_msg","payload":{"type":"item_completed","item_type":"EnteredReviewMode"}}"#,
-            "\n",
-            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"No issues."}]}}"#,
-            "\n"
-        );
-        let file2 = create_test_file(payload_item_type);
-        let parsed2 = parse_codex_file_incremental(file2.path(), 0, CodexParseState::default());
-        assert!(parsed2.state.has_entered_review_mode);
-        assert!(parsed2.is_review_parent_rollout());
-        assert!(!parsed2.is_missing_usage());
-
-        // Variant 3: array item with kind
-        let array_item = concat!(
-            r#"{"type":"session_meta","payload":{"id":"00000000-0000-7000-8000-000000000001","thread_source":"user"}}"#,
-            "\n",
-            r#"{"type":"event_msg","payload":{"type":"item_completed","item":[{"kind":"ENTERED_REVIEW_MODE"}]}}"#,
-            "\n",
-            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"No issues."}]}}"#,
-            "\n"
-        );
-        let file3 = create_test_file(array_item);
-        let parsed3 = parse_codex_file_incremental(file3.path(), 0, CodexParseState::default());
-        assert!(parsed3.state.has_entered_review_mode);
-        assert!(parsed3.is_review_parent_rollout());
-        assert!(!parsed3.is_missing_usage());
     }
 
     #[test]

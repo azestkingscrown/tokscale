@@ -31,8 +31,6 @@
     "pending_turn_start": true,
     "forked_child_task_started_turn_ids": [],
     "forked_child_is_user_fork": false,
-    "has_entered_review_mode": false,
-    "has_own_turn_context": true,
     "session_owned_by_openclaw": false,
     "current_turn_id": "turn-2",
     "turn_id_announced_by_task_started": false,
