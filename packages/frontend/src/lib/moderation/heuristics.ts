@@ -31,6 +31,7 @@ export interface CandidateRow {
   dailyTokens: number;
   dailyMaxTokens?: number;
   dailyMaxOutputTokens?: number;
+  maxTokensPerMessage?: number;
   outputTokens?: number;
   totalActiveTimeMs?: number;
   /** Total cost after removing legacy Cursor charges with no token attribution. */
@@ -125,7 +126,8 @@ export interface CandidateSignal {
     | "impliedRate"
     | "outputRate"
     | "usageLimit"
-    | "slopModelName";
+    | "slopModelName"
+    | "tokensPerMessage";
   /** Shown verbatim in the review UI. */
   label: string;
   weight: number;
@@ -453,6 +455,13 @@ export const REVIEW_OUTPUT_TOKEN_FLOOR = 1_000_000;
  */
 export const REVIEW_MAX_OUTPUT_TOKENS_PER_ACTIVE_SECOND = 10_000;
 /**
+ * Advisory review threshold for per-message token volume.
+ * Commercial production context windows ceiling at 1M-2M tokens.
+ * A single message averaging > 10,000,000 tokens is far outside plausible
+ * LLM context boundaries and warrants administrator inspection.
+ */
+export const REVIEW_MAX_TOKENS_PER_MESSAGE = 10_000_000;
+/**
  * Daily rows should sum to roughly the stored total. A large gap is the
  * fingerprint of the ratchet, not of heavy usage.
  */
@@ -482,9 +491,19 @@ export function scoreCandidate(
     totalTokens: row.dailyTokens,
     maxDailyTokens: row.dailyMaxTokens,
     maxDailyOutputTokens: row.dailyMaxOutputTokens,
+    maxTokensPerMessage: row.maxTokensPerMessage,
   });
   if (volume.shouldWithhold) {
     signals.push({ key: "usageLimit", label: volume.reason, weight: 50 });
+  }
+
+  const maxTokensPerMessage = row.maxTokensPerMessage ?? 0;
+  if (maxTokensPerMessage > REVIEW_MAX_TOKENS_PER_MESSAGE) {
+    signals.push({
+      key: "tokensPerMessage",
+      label: `Recorded volume of ${Math.round(maxTokensPerMessage).toLocaleString("en-US")} tokens/message exceeds the review threshold of ${REVIEW_MAX_TOKENS_PER_MESSAGE.toLocaleString("en-US")} tokens/message; LLM context window may be implausible`,
+      weight: 25,
+    });
   }
 
   // Device high-waters and filtered submits can cover less history than the

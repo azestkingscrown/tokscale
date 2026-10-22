@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   MIN_REVIEW_COST,
   REVIEW_MAX_OUTPUT_TOKENS_PER_ACTIVE_SECOND,
+  REVIEW_MAX_TOKENS_PER_MESSAGE,
   REVIEW_OUTPUT_TOKEN_FLOOR,
   SLOP_MODEL_REGEX,
   UNKNOWABLE_BUCKET_WIDTH,
@@ -302,6 +303,79 @@ describe("scoreCandidate", () => {
     );
 
     expect(scored.signals).toEqual([]);
+  });
+
+  it.each([
+    { perMsg: REVIEW_MAX_TOKENS_PER_MESSAGE - 1, flagged: false },
+    { perMsg: REVIEW_MAX_TOKENS_PER_MESSAGE, flagged: false },
+    { perMsg: REVIEW_MAX_TOKENS_PER_MESSAGE + 0.1, flagged: true },
+    { perMsg: REVIEW_MAX_TOKENS_PER_MESSAGE - 0.1, flagged: false },
+    { perMsg: REVIEW_MAX_TOKENS_PER_MESSAGE + 1, flagged: true },
+  ])("checks per-message volume review boundary at $perMsg tokens/msg", ({ perMsg, flagged }) => {
+    const scored = scoreCandidate(
+      row({
+        totalTokens: Math.round(perMsg),
+        dailyTokens: Math.round(perMsg),
+        maxTokensPerMessage: perMsg,
+      }),
+      CONTEXT
+    );
+
+    expect(signalKeys(scored)).toEqual(flagged ? ["tokensPerMessage"] : []);
+    expect(scored.score).toBe(flagged ? 25 : 0);
+  });
+
+  it("flags single message with 1+ billion tokens with both usageLimit and tokensPerMessage", () => {
+    const scored = scoreCandidate(
+      row({
+        username: "billion_spoofer",
+        totalTokens: 1_200_000_000,
+        dailyTokens: 1_200_000_000,
+        maxTokensPerMessage: 1_200_000_000,
+      }),
+      CONTEXT
+    );
+
+    expect(signalKeys(scored)).toContain("usageLimit");
+    expect(signalKeys(scored)).toContain("tokensPerMessage");
+    const usageSignal = scored.signals.find((s) => s.key === "usageLimit");
+    expect(usageSignal?.weight).toBe(50);
+    expect(usageSignal?.label).toContain("Per-message volume");
+    const msgSignal = scored.signals.find((s) => s.key === "tokensPerMessage");
+    expect(msgSignal?.weight).toBe(25);
+    expect(msgSignal?.label).toContain("tokens/message exceeds the review threshold");
+    expect(scored.score).toBeGreaterThanOrEqual(75);
+  });
+
+  it.each([undefined, 0])("does not flag when maxTokensPerMessage is %s", (maxTokensPerMessage) => {
+    const scored = scoreCandidate(
+      row({
+        totalTokens: 1_000_000,
+        dailyTokens: 1_000_000,
+        maxTokensPerMessage,
+      }),
+      CONTEXT
+    );
+
+    expect(signalKeys(scored)).not.toContain("tokensPerMessage");
+    expect(signalKeys(scored)).not.toContain("usageLimit");
+  });
+
+  it("does not flag Cursor legacy accounts with zero tokens and zero maxTokensPerMessage", () => {
+    const scored = scoreCandidate(
+      row({
+        username: "cursor_legacy_user",
+        totalTokens: 0,
+        dailyTokens: 0,
+        maxTokensPerMessage: 0,
+        totalCost: 15.0,
+        tokenAttributedCost: 0,
+      }),
+      CONTEXT
+    );
+
+    expect(signalKeys(scored)).not.toContain("tokensPerMessage");
+    expect(signalKeys(scored)).not.toContain("usageLimit");
   });
 
   it("does not flag a very low implied rate, which local and free models produce", () => {

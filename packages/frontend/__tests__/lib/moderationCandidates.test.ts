@@ -52,6 +52,7 @@ vi.mock("@/lib/groups/cache", () => ({
 
 describe("getModerationCandidates - moderation action metadata exposure", () => {
   afterEach(() => {
+    vi.clearAllMocks();
     vi.restoreAllMocks();
   });
 
@@ -176,6 +177,59 @@ describe("getModerationCandidates - moderation action metadata exposure", () => 
     expect(candidate.latestActorUsername).toBeNull();
     expect(candidate.latestAction).toBeNull();
     expect(candidate.latestActionReason).toBeNull();
+  });
+
+  it("includes tokens_per_msg CTE and maps max_tokens_per_message onto candidate", async () => {
+    const mockDbRow = {
+      user_id: "user-per-msg",
+      username: "per_msg_spoofer",
+      avatar_url: null,
+      leaderboard_hidden: false,
+      total_tokens: "1000000000",
+      total_cost: "50.0000",
+      submit_count: 1,
+      has_backfill: false,
+      daily_tokens: "1000000000",
+      near_duplicate_count: 0,
+      slop_models: [],
+      slop_tokens: 0,
+      has_over_nested_entry: false,
+      every_day_attributed: true,
+      attributed_tokens: "1000000000",
+      site_tokens: "5000000000",
+      median_tokens: "500000",
+      latest_actor_username: null,
+      latest_action: null,
+      latest_action_reason: null,
+      max_tokens_per_message: "123456789.5",
+    };
+
+    vi.mocked(db.execute).mockResolvedValueOnce([mockDbRow] as unknown as never);
+
+    const candidates = await getModerationCandidates();
+
+    expect(db.execute).toHaveBeenCalledTimes(1);
+    const query = dialect.sqlToQuery(vi.mocked(db.execute).mock.calls[0][0] as unknown as SQL);
+    const executedSql = query.sql.replace(/\s+/g, " ");
+
+    expect(executedSql).toContain("tokens_per_msg AS (");
+    expect(executedSql).toContain("LEFT JOIN tokens_per_msg tpm ON tpm.submission_id = p.submission_id");
+    expect(executedSql).toContain("COALESCE(tpm.max_tokens_per_message, 0) AS max_tokens_per_message");
+    expect(executedSql).toMatch(/OR max_tokens_per_message > \$\d+/);
+    expect(query.params).toContain(100_000_000);
+    expect(query.params).toContain(10_000_000);
+
+    expect(candidates).toHaveLength(1);
+    const candidate = candidates[0];
+    expect(candidate.username).toBe("per_msg_spoofer");
+    expect(candidate.maxTokensPerMessage).toBe(123456789.5);
+    expect(candidate.score).toBeGreaterThanOrEqual(75);
+    expect(candidate.signals).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ key: "usageLimit" }),
+        expect.objectContaining({ key: "tokensPerMessage" }),
+      ])
+    );
   });
 });
 
