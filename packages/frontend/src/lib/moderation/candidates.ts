@@ -5,6 +5,7 @@ import {
   MAX_IMPLIED_RATE,
   MIN_REVIEW_COST,
   MEDIAN_RATIO_THRESHOLD,
+  REVIEW_MAX_TOKENS_PER_MESSAGE,
   SLOP_MODEL_REGEX,
   UNNAMED_MODEL_REGEX,
   UNKNOWABLE_EVENT,
@@ -20,6 +21,7 @@ import {
   WITHHOLDING_MAX_DAILY_OUTPUT_TOKENS,
   WITHHOLDING_MAX_DAILY_TOTAL_TOKENS,
   WITHHOLDING_MAX_TOTAL_TOKENS,
+  WITHHOLDING_MAX_TOKENS_PER_MESSAGE,
 } from "./withholding";
 
 /**
@@ -52,6 +54,7 @@ interface CandidateDbRow extends Record<string, unknown> {
   latest_action_reason?: string | null;
   daily_max_tokens?: number | string | null;
   daily_max_output_tokens?: number | string | null;
+  max_tokens_per_message?: number | string | null;
   output_tokens?: number | string | null;
   total_active_time_ms?: number | string | null;
   token_attributed_cost?: number | string | null;
@@ -146,6 +149,87 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         BOOL_AND(every_day_attributed) AS every_day_attributed
       FROM daily_by_date
       GROUP BY submission_id
+    ),
+    tokens_per_msg AS (
+      SELECT
+        d.submission_id,
+        MAX(
+          GREATEST(
+            CASE
+              WHEN (client.value->>'messages') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
+                AND (client.value->>'messages')::numeric > 0
+              THEN
+                GREATEST(
+                  CASE
+                    WHEN (client.value->>'tokens') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
+                    THEN (client.value->>'tokens')::numeric
+                    ELSE 0
+                  END,
+                  COALESCE(
+                    CASE WHEN (client.value->>'input') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'input')::numeric ELSE 0 END +
+                    CASE WHEN (client.value->>'output') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'output')::numeric ELSE 0 END +
+                    CASE WHEN (client.value->>'cacheRead') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'cacheRead')::numeric ELSE 0 END +
+                    CASE WHEN (client.value->>'cacheWrite') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'cacheWrite')::numeric ELSE 0 END +
+                    CASE WHEN (client.value->>'reasoning') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'reasoning')::numeric ELSE 0 END,
+                    0
+                  ),
+                  COALESCE(
+                    CASE WHEN (client.value->'tokens'->>'input') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'input')::numeric ELSE 0 END +
+                    CASE WHEN (client.value->'tokens'->>'output') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'output')::numeric ELSE 0 END +
+                    CASE WHEN (client.value->'tokens'->>'cacheRead') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'cacheRead')::numeric ELSE 0 END +
+                    CASE WHEN (client.value->'tokens'->>'cacheWrite') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'cacheWrite')::numeric ELSE 0 END +
+                    CASE WHEN (client.value->'tokens'->>'reasoning') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'reasoning')::numeric ELSE 0 END,
+                    0
+                  )
+                ) / (client.value->>'messages')::numeric
+              ELSE 0
+            END,
+            COALESCE(m.max_model_tokens_per_message, 0)
+          )
+        ) AS max_tokens_per_message
+      FROM daily_breakdown d
+      CROSS JOIN LATERAL jsonb_each(
+        CASE WHEN jsonb_typeof(d.source_breakdown) = 'object' THEN d.source_breakdown ELSE '{}'::jsonb END
+      ) AS client(key, value)
+      LEFT JOIN LATERAL (
+        SELECT
+          MAX(
+            CASE
+              WHEN (model.value->>'messages') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
+                AND (model.value->>'messages')::numeric > 0
+              THEN
+                GREATEST(
+                  CASE
+                    WHEN (model.value->>'tokens') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
+                    THEN (model.value->>'tokens')::numeric
+                    ELSE 0
+                  END,
+                  COALESCE(
+                    CASE WHEN (model.value->>'input') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'input')::numeric ELSE 0 END +
+                    CASE WHEN (model.value->>'output') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'output')::numeric ELSE 0 END +
+                    CASE WHEN (model.value->>'cacheRead') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'cacheRead')::numeric ELSE 0 END +
+                    CASE WHEN (model.value->>'cacheWrite') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'cacheWrite')::numeric ELSE 0 END +
+                    CASE WHEN (model.value->>'reasoning') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'reasoning')::numeric ELSE 0 END,
+                    0
+                  ),
+                  COALESCE(
+                    CASE WHEN (model.value->'tokens'->>'input') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'input')::numeric ELSE 0 END +
+                    CASE WHEN (model.value->'tokens'->>'output') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'output')::numeric ELSE 0 END +
+                    CASE WHEN (model.value->'tokens'->>'cacheRead') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'cacheRead')::numeric ELSE 0 END +
+                    CASE WHEN (model.value->'tokens'->>'cacheWrite') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'cacheWrite')::numeric ELSE 0 END +
+                    CASE WHEN (model.value->'tokens'->>'reasoning') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'reasoning')::numeric ELSE 0 END,
+                    0
+                  )
+                ) / (model.value->>'messages')::numeric
+              ELSE 0
+            END
+          ) AS max_model_tokens_per_message
+        FROM jsonb_each(
+          CASE WHEN jsonb_typeof(client.value->'models') = 'object' THEN client.value->'models' ELSE '{}'::jsonb END
+        ) AS model(key, value)
+      ) m ON true
+      WHERE jsonb_typeof(d.source_breakdown) = 'object'
+      GROUP BY d.submission_id
     ),
     -- modelsForHighWater() assigns a partial map's scalar remainder to
     -- modelId, or to "unknown" when absent. Exclude tokenless premium charges
@@ -377,6 +461,7 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         COALESCE(dl.daily_tokens, 0) AS daily_tokens,
         COALESCE(dl.daily_max_tokens, 0) AS daily_max_tokens,
         COALESCE(dl.daily_max_output_tokens, 0) AS daily_max_output_tokens,
+        COALESCE(tpm.max_tokens_per_message, 0) AS max_tokens_per_message,
         GREATEST(p.total_cost - COALESCE(cntc.excluded_cost, 0), 0) AS token_attributed_cost,
         -- A share is only meaningful when every one of this account's tokens
         -- is attributed to a named model. Tokens nobody claims — a scalar
@@ -428,6 +513,7 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
       LEFT JOIN daily dl ON dl.submission_id = p.submission_id
       LEFT JOIN cursor_non_token_cost cntc ON cntc.submission_id = p.submission_id
       LEFT JOIN slop_usage su ON su.submission_id = p.submission_id
+      LEFT JOIN tokens_per_msg tpm ON tpm.submission_id = p.submission_id
       LEFT JOIN latest_mod lm ON lm.target_user_id = p.user_id
       CROSS JOIN site
     ),
@@ -438,6 +524,8 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         OR daily_max_output_tokens > ${WITHHOLDING_MAX_DAILY_OUTPUT_TOKENS}
         OR daily_max_tokens > ${WITHHOLDING_MAX_DAILY_TOTAL_TOKENS}
         OR daily_tokens >= ${WITHHOLDING_MAX_TOTAL_TOKENS}
+        OR max_tokens_per_message > ${WITHHOLDING_MAX_TOKENS_PER_MESSAGE}
+        OR max_tokens_per_message > ${REVIEW_MAX_TOKENS_PER_MESSAGE}
         OR (
           output_tokens >= ${REVIEW_OUTPUT_TOKEN_FLOOR}
           AND total_active_time_ms > 0
@@ -462,7 +550,8 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
       near_duplicate_count, slop_models, slop_tokens,
       has_over_nested_entry, every_day_attributed, attributed_tokens,
       site_tokens, median_tokens,
-      latest_actor_username, latest_action, latest_action_reason
+      latest_actor_username, latest_action, latest_action_reason,
+      max_tokens_per_message
     FROM eligible
   `);
 
@@ -480,6 +569,7 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
     dailyTokens: toNumber(row.daily_tokens),
     dailyMaxTokens: toNumber(row.daily_max_tokens),
     dailyMaxOutputTokens: toNumber(row.daily_max_output_tokens),
+    maxTokensPerMessage: toNumber(row.max_tokens_per_message),
     outputTokens: toNumber(row.output_tokens),
     totalActiveTimeMs: toNumber(row.total_active_time_ms),
     tokenAttributedCost: toNumber(row.token_attributed_cost ?? row.total_cost),

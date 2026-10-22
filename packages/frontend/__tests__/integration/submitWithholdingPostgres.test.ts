@@ -39,8 +39,10 @@ function database(): Sql {
 function tokens(input = 0, output = 0, cacheRead = 0): Day["tokenBreakdown"] {
   return { input, output, cacheRead, cacheWrite: 0, reasoning: 0 };
 }
-function client(client: Client["client"], modelId: string, t: Client["tokens"], cost = 0.01): Client {
-  return { client, modelId, tokens: t, cost, messages: 2 };
+function client(client: Client["client"], modelId: string, t: Client["tokens"], cost = 0.01, messages?: number): Client {
+  const total = Object.values(t).reduce((s, n) => s + n, 0);
+  const msgCount = messages ?? Math.max(2, Math.ceil(total / 50_000));
+  return { client, modelId, tokens: t, cost, messages: msgCount };
 }
 function payload(clients: Client[], opts: {
   device?: string; date?: string; metrics?: SubmissionData["timeMetrics"]; complete?: boolean;
@@ -53,6 +55,7 @@ function payload(clients: Client[], opts: {
   }
   const totalTokens = Object.values(breakdown).reduce((s, n) => s + n, 0);
   const totalCost = clients.reduce((s, c) => s + c.cost, 0);
+  const totalMessages = clients.reduce((s, c) => s + c.messages, 0);
   const date = opts.date ?? "2026-04-30";
   return {
     meta: { generatedAt: "2026-05-01T00:00:00Z", version: "4.20.0", dateRange: { start: date, end: date } },
@@ -64,7 +67,7 @@ function payload(clients: Client[], opts: {
     },
     years: [{ year: date.slice(0, 4), totalTokens, totalCost, range: { start: date, end: date } }],
     contributions: [{
-      date, clients, totals: { tokens: totalTokens, cost: totalCost, messages: clients.length * 2, ...(opts.complete === false ? { costIsComplete: false } : {}) },
+      date, clients, totals: { tokens: totalTokens, cost: totalCost, messages: totalMessages, ...(opts.complete === false ? { costIsComplete: false } : {}) },
       intensity: 1, tokenBreakdown: breakdown,
     }],
     ...(opts.metrics ? { timeMetrics: opts.metrics } : {}),
@@ -463,5 +466,62 @@ describeWithPostgres("submission withholding PostgreSQL integration", () => {
     expect(Object.keys(r.source_breakdown.claude.models)).toHaveLength(2);
     expect(await hidden(a)).toBe(false);
     expect(await signals(a)).not.toContain("usageLimit");
+  });
+
+  it("atomically withholds physically impossible single-message token volume (1+ billion tokens / 1 msg)", async () => {
+    const a = await account();
+    const cs = [client("claude", "claude-sonnet-4", tokens(1_000_000_000, 500), 10, 1)];
+    await submit(a, payload(cs));
+    expect(await hidden(a)).toBe(true);
+    expect(await signals(a)).toContain("usageLimit");
+    expect(await signals(a)).toContain("tokensPerMessage");
+    const [action] = await getModerationHistory(a.id);
+    expect(action.action).toBe("hide");
+    expect(action.actorUsername).toBe("system");
+    expect(action.reason).toBe("Under investigation");
+  });
+
+  it("observes physically impossible single-message volume without hiding in observe mode", async () => {
+    vi.stubEnv("ENABLE_SUBMISSION_AUTOHIDE", "observe");
+    const a = await account();
+    const cs = [client("claude", "claude-sonnet-4", tokens(1_200_000_000, 500), 10, 1)];
+    await submit(a, payload(cs));
+    expect(await hidden(a)).toBe(false);
+    expect(await signals(a)).toContain("usageLimit");
+    expect(await signals(a)).toContain("tokensPerMessage");
+  });
+
+  it("prevents dilution across multiple devices on the same date", async () => {
+    const a = await account();
+    const spoofedClient = [client("claude", "claude-sonnet-4", tokens(1_500_000_000, 500), 10, 1)];
+    const normalClient = [client("codex", "gpt-4o", tokens(10_000, 5000), 1, 1000)];
+    await submit(a, payload(spoofedClient, { device: "device-1" }));
+    await submit(a, payload(normalClient, { device: "device-2" }));
+    expect(await hidden(a)).toBe(true);
+    expect(await signals(a)).toContain("usageLimit");
+    expect(await signals(a)).toContain("tokensPerMessage");
+  });
+
+  it("flags impossible per-message volume when formatted in scientific notation in sourceBreakdown", async () => {
+    const a = await account();
+    const cs = [client("claude", "claude-sonnet-4", tokens(1000, 500), 10, 1)];
+    await submit(a, payload(cs));
+    const sql = database();
+    await sql`
+      UPDATE daily_breakdown
+      SET source_breakdown = jsonb_set(
+        source_breakdown,
+        '{claude,tokens}',
+        '"1.5e9"'::jsonb
+      ),
+      tokens = 1500000000
+      WHERE submission_id = (SELECT id FROM submissions WHERE user_id = ${a.id})
+    `;
+    const candidates = await getModerationCandidates();
+    const candidate = candidates.find(c => c.userId === a.id);
+    expect(candidate).toBeDefined();
+    expect(candidate!.maxTokensPerMessage).toBe(1_500_000_000);
+    expect(candidate!.signals.map(s => s.key)).toContain("usageLimit");
+    expect(candidate!.signals.map(s => s.key)).toContain("tokensPerMessage");
   });
 });

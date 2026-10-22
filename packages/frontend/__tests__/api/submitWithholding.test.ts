@@ -320,6 +320,25 @@ describe("POST /api/submit - ledger withholding", () => {
     aggregates: { totalTokens: 20_000_000_000, totalCost: "1000", inputTokens: 0, outputTokens: 20_000_000_000 },
   };
 
+  const excessivePerMessage: MockTxOptions = {
+    aggregates: { totalTokens: 1_200_000_000, totalCost: "50", inputTokens: 1_200_000_000, outputTokens: 500 },
+    allDaysSourceBreakdown: {
+      claude: {
+        tokens: 1_200_000_000,
+        cost: 50,
+        input: 1_200_000_000,
+        output: 500,
+        messages: 1,
+        models: {
+          "claude-3-5-sonnet": {
+            tokens: 1_200_000_000,
+            messages: 1,
+          },
+        },
+      },
+    },
+  };
+
   it("keeps ordinary usage visible", async () => {
     const ctx = await submit();
     expect(ctx.usersUpdates).toHaveLength(0);
@@ -335,6 +354,29 @@ describe("POST /api/submit - ledger withholding", () => {
     expect(mockState.revalidatePath).toHaveBeenCalledWith("/");
     expect(mockState.revalidatePath).toHaveBeenCalledWith("/leaderboard");
     expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"applied":true'));
+  });
+
+  it("atomically hides physically impossible single-message token volume (1+ billion tokens / 1 msg)", async () => {
+    const ctx = await submit(excessivePerMessage);
+    expect(ctx.usersUpdates).toEqual([expect.objectContaining({ leaderboardHidden: true })]);
+    expect(ctx.moderationActionInserts).toEqual([expect.objectContaining({
+      actorUsername: "system", action: "hide", reason: "Under investigation",
+    })]);
+    expect(mockState.revalidatePath).toHaveBeenCalledWith("/");
+    expect(mockState.revalidatePath).toHaveBeenCalledWith("/leaderboard");
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"trigger":"per_message_token_limit"'));
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"applied":true'));
+  });
+
+  it("observes physically impossible single-message token volume without hiding in observe mode", async () => {
+    vi.stubEnv("ENABLE_SUBMISSION_AUTOHIDE", "observe");
+    const ctx = await submit(excessivePerMessage);
+    expect(ctx.usersUpdates).toHaveLength(0);
+    expect(ctx.moderationActionInserts).toHaveLength(0);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"mode":"observe"'));
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"trigger":"per_message_token_limit"'));
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"shouldWithhold":true'));
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"applied":false'));
   });
 
   it.each([undefined, "observe", "unexpected"])("observes without changing accounts in mode %s", async (mode) => {
