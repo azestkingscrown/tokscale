@@ -18,6 +18,7 @@ import {
   type ScoredCandidate,
 } from "./heuristics";
 import {
+  NON_PER_INFERENCE_CLIENT_REGEX,
   WITHHOLDING_MAX_DAILY_OUTPUT_TOKENS,
   WITHHOLDING_MAX_DAILY_TOTAL_TOKENS,
   WITHHOLDING_MAX_TOTAL_TOKENS,
@@ -96,8 +97,8 @@ function toBigInt(value: number | string | null | undefined): bigint {
  * Builds the review queue: every user with at least one suspicion signal, plus
  * everyone currently hidden so past decisions stay visible and reversible.
  *
- * Read-only. Includes volume-limit observations even while automated
- * withholding is disabled, so an operator can review before enabling it.
+ * Read-only. Surfaces volume-limit signals alongside advisory heuristics so
+ * operators can review and reverse automated or manual decisions.
  */
 export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
   const result = await db.execute<CandidateDbRow>(sql`
@@ -156,79 +157,113 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         MAX(
           GREATEST(
             CASE
-              WHEN (client.value->>'messages') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
+              WHEN (client.value->>'messages') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
                 AND (client.value->>'messages')::numeric > 0
               THEN
                 GREATEST(
-                  CASE
-                    WHEN (client.value->>'tokens') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
-                    THEN (client.value->>'tokens')::numeric
-                    ELSE 0
-                  END,
-                  COALESCE(
-                    CASE WHEN (client.value->>'input') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'input')::numeric ELSE 0 END +
-                    CASE WHEN (client.value->>'output') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'output')::numeric ELSE 0 END +
-                    CASE WHEN (client.value->>'cacheRead') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'cacheRead')::numeric ELSE 0 END +
-                    CASE WHEN (client.value->>'cacheWrite') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'cacheWrite')::numeric ELSE 0 END +
-                    CASE WHEN (client.value->>'reasoning') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'reasoning')::numeric ELSE 0 END,
-                    0
-                  ),
-                  COALESCE(
-                    CASE WHEN (client.value->'tokens'->>'input') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'input')::numeric ELSE 0 END +
-                    CASE WHEN (client.value->'tokens'->>'output') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'output')::numeric ELSE 0 END +
-                    CASE WHEN (client.value->'tokens'->>'cacheRead') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'cacheRead')::numeric ELSE 0 END +
-                    CASE WHEN (client.value->'tokens'->>'cacheWrite') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'cacheWrite')::numeric ELSE 0 END +
-                    CASE WHEN (client.value->'tokens'->>'reasoning') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'reasoning')::numeric ELSE 0 END,
-                    0
-                  )
+                  c.client_tokens - CASE WHEN ov.over_nested THEN 0 ELSE COALESCE(m.zero_msg_model_tokens, 0) END,
+                  0
                 ) / (client.value->>'messages')::numeric
               ELSE 0
             END,
-            COALESCE(m.max_model_tokens_per_message, 0)
+            CASE
+              WHEN ov.over_nested
+              THEN 0
+              ELSE COALESCE(m.max_model_tokens_per_message, 0)
+            END
           )
         ) AS max_tokens_per_message
       FROM daily_breakdown d
       CROSS JOIN LATERAL jsonb_each(
         CASE WHEN jsonb_typeof(d.source_breakdown) = 'object' THEN d.source_breakdown ELSE '{}'::jsonb END
       ) AS client(key, value)
+      CROSS JOIN LATERAL (
+        SELECT
+          GREATEST(
+            CASE
+              WHEN (client.value->>'tokens') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
+              THEN (client.value->>'tokens')::numeric
+              ELSE 0
+            END,
+            COALESCE(
+              CASE WHEN (client.value->>'input') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'input')::numeric ELSE 0 END +
+              CASE WHEN (client.value->>'output') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'output')::numeric ELSE 0 END +
+              CASE WHEN (client.value->>'cacheRead') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'cacheRead')::numeric ELSE 0 END +
+              CASE WHEN (client.value->>'cacheWrite') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'cacheWrite')::numeric ELSE 0 END +
+              CASE WHEN (client.value->>'reasoning') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->>'reasoning')::numeric ELSE 0 END,
+              0
+            ),
+            COALESCE(
+              CASE WHEN (client.value->'tokens'->>'input') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'input')::numeric ELSE 0 END +
+              CASE WHEN (client.value->'tokens'->>'output') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'output')::numeric ELSE 0 END +
+              CASE WHEN (client.value->'tokens'->>'cacheRead') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'cacheRead')::numeric ELSE 0 END +
+              CASE WHEN (client.value->'tokens'->>'cacheWrite') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'cacheWrite')::numeric ELSE 0 END +
+              CASE WHEN (client.value->'tokens'->>'reasoning') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (client.value->'tokens'->>'reasoning')::numeric ELSE 0 END,
+              0
+            ),
+            0
+          ) AS client_tokens
+      ) c
       LEFT JOIN LATERAL (
         SELECT
           MAX(
             CASE
-              WHEN (model.value->>'messages') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
-                AND (model.value->>'messages')::numeric > 0
-              THEN
-                GREATEST(
-                  CASE
-                    WHEN (model.value->>'tokens') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
-                    THEN (model.value->>'tokens')::numeric
-                    ELSE 0
-                  END,
-                  COALESCE(
-                    CASE WHEN (model.value->>'input') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'input')::numeric ELSE 0 END +
-                    CASE WHEN (model.value->>'output') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'output')::numeric ELSE 0 END +
-                    CASE WHEN (model.value->>'cacheRead') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'cacheRead')::numeric ELSE 0 END +
-                    CASE WHEN (model.value->>'cacheWrite') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'cacheWrite')::numeric ELSE 0 END +
-                    CASE WHEN (model.value->>'reasoning') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'reasoning')::numeric ELSE 0 END,
-                    0
-                  ),
-                  COALESCE(
-                    CASE WHEN (model.value->'tokens'->>'input') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'input')::numeric ELSE 0 END +
-                    CASE WHEN (model.value->'tokens'->>'output') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'output')::numeric ELSE 0 END +
-                    CASE WHEN (model.value->'tokens'->>'cacheRead') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'cacheRead')::numeric ELSE 0 END +
-                    CASE WHEN (model.value->'tokens'->>'cacheWrite') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'cacheWrite')::numeric ELSE 0 END +
-                    CASE WHEN (model.value->'tokens'->>'reasoning') ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'reasoning')::numeric ELSE 0 END,
-                    0
-                  )
-                ) / (model.value->>'messages')::numeric
+              WHEN mv.model_messages > 0
+              THEN mv.model_tokens / mv.model_messages
               ELSE 0
             END
-          ) AS max_model_tokens_per_message
+          ) AS max_model_tokens_per_message,
+          COALESCE(SUM(mv.model_tokens), 0) AS nested_tokens,
+          COALESCE(
+            SUM(mv.model_tokens) FILTER (WHERE mv.model_messages <= 0),
+            0
+          ) AS zero_msg_model_tokens
         FROM jsonb_each(
           CASE WHEN jsonb_typeof(client.value->'models') = 'object' THEN client.value->'models' ELSE '{}'::jsonb END
         ) AS model(key, value)
+        CROSS JOIN LATERAL (
+          SELECT
+            GREATEST(
+              CASE
+                WHEN (model.value->>'tokens') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
+                THEN (model.value->>'tokens')::numeric
+                ELSE 0
+              END,
+              COALESCE(
+                CASE WHEN (model.value->>'input') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'input')::numeric ELSE 0 END +
+                CASE WHEN (model.value->>'output') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'output')::numeric ELSE 0 END +
+                CASE WHEN (model.value->>'cacheRead') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'cacheRead')::numeric ELSE 0 END +
+                CASE WHEN (model.value->>'cacheWrite') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'cacheWrite')::numeric ELSE 0 END +
+                CASE WHEN (model.value->>'reasoning') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->>'reasoning')::numeric ELSE 0 END,
+                0
+              ),
+              COALESCE(
+                CASE WHEN (model.value->'tokens'->>'input') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'input')::numeric ELSE 0 END +
+                CASE WHEN (model.value->'tokens'->>'output') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'output')::numeric ELSE 0 END +
+                CASE WHEN (model.value->'tokens'->>'cacheRead') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'cacheRead')::numeric ELSE 0 END +
+                CASE WHEN (model.value->'tokens'->>'cacheWrite') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'cacheWrite')::numeric ELSE 0 END +
+                CASE WHEN (model.value->'tokens'->>'reasoning') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' THEN (model.value->'tokens'->>'reasoning')::numeric ELSE 0 END,
+                0
+              ),
+              0
+            ) AS model_tokens,
+            CASE
+              WHEN (model.value->>'messages') ~ '^[+]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$'
+                AND (model.value->>'messages')::numeric > 0
+              THEN (model.value->>'messages')::numeric
+              ELSE 0
+            END AS model_messages
+        ) mv
+        WHERE jsonb_typeof(model.value) = 'object'
       ) m ON true
+      CROSS JOIN LATERAL (
+        SELECT
+          c.client_tokens > 0 AND COALESCE(m.nested_tokens, 0) > c.client_tokens AS over_nested
+      ) ov
       WHERE jsonb_typeof(d.source_breakdown) = 'object'
+        AND jsonb_typeof(client.value) = 'object'
+        AND LENGTH(TRIM(client.key)) > 0
+        AND LOWER(TRIM(client.key)) !~ ${NON_PER_INFERENCE_CLIENT_REGEX}
       GROUP BY d.submission_id
     ),
     -- modelsForHighWater() assigns a partial map's scalar remainder to

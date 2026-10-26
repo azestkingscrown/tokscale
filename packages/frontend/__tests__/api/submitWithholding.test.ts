@@ -114,7 +114,6 @@ let POST: ModuleExports["POST"];
 
 beforeEach(async () => {
   mockState.reset();
-  delete process.env.ENABLE_SUBMISSION_AUTOHIDE;
   const routeModule = await import("../../src/app/api/submit/route");
   POST = routeModule.POST;
 });
@@ -286,7 +285,6 @@ function createRequest(body: unknown) {
 
 describe("POST /api/submit - ledger withholding", () => {
   beforeEach(() => {
-    vi.stubEnv("ENABLE_SUBMISSION_AUTOHIDE", "1");
     vi.spyOn(console, "warn").mockImplementation(() => {});
     mockState.authenticatePersonalToken.mockResolvedValue({
       status: "valid", tokenId: "token-1", userId: "user-1", username: "alice",
@@ -295,7 +293,6 @@ describe("POST /api/submit - ledger withholding", () => {
   });
 
   afterEach(() => {
-    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
 
@@ -368,41 +365,84 @@ describe("POST /api/submit - ledger withholding", () => {
     expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"applied":true'));
   });
 
-  it("observes physically impossible single-message token volume without hiding in observe mode", async () => {
-    vi.stubEnv("ENABLE_SUBMISSION_AUTOHIDE", "observe");
-    const ctx = await submit(excessivePerMessage);
-    expect(ctx.usersUpdates).toHaveLength(0);
-    expect(ctx.moderationActionInserts).toHaveLength(0);
-    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"mode":"observe"'));
-    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"trigger":"per_message_token_limit"'));
-    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"shouldWithhold":true'));
-    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"applied":false'));
-  });
-
-  it.each([undefined, "observe", "unexpected"])("observes without changing accounts in mode %s", async (mode) => {
-    vi.stubEnv("ENABLE_SUBMISSION_AUTOHIDE", mode);
-    const ctx = await submit(excessiveOutput);
-    expect(ctx.usersUpdates).toHaveLength(0);
-    expect(ctx.moderationActionInserts).toHaveLength(0);
-    expect(ctx.tx.select.mock.calls.some(([cols]) => "leaderboardHidden" in cols)).toBe(false);
-    expect(mockState.revalidatePath).not.toHaveBeenCalled();
-    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"mode":"observe"'));
-    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"shouldWithhold":true'));
-    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"applied":false'));
-  });
-
-  it("logs clean observations as well as limit violations", async () => {
-    vi.stubEnv("ENABLE_SUBMISSION_AUTOHIDE", undefined);
+  it("logs clean evaluations as well as limit violations", async () => {
     await submit();
     expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"shouldWithhold":false'));
   });
 
-  it("disables evaluations and their logs with the kill switch", async () => {
-    vi.stubEnv("ENABLE_SUBMISSION_AUTOHIDE", "0");
-    const ctx = await submit(excessiveOutput);
+  it("keeps a 200M-token count-neutral Droid fragment visible alongside a 1-message Codex contribution", async () => {
+    const ctx = await submit({
+      aggregates: { totalTokens: 200_000_100, totalCost: "20", inputTokens: 200_000_100, outputTokens: 0 },
+      allDaysRows: [
+        {
+          date: "2026-04-30",
+          tokens: 200_000_000,
+          outputTokens: 0,
+          sourceBreakdown: {
+            droid: {
+              tokens: 200_000_000,
+              messages: 0,
+              models: { "claude-sonnet-4": { tokens: 200_000_000, messages: 0 } },
+            },
+          },
+        },
+        {
+          date: "2026-04-30",
+          tokens: 100,
+          outputTokens: 0,
+          sourceBreakdown: {
+            codex: {
+              tokens: 100,
+              messages: 1,
+              models: { "gpt-5": { tokens: 100, messages: 1 } },
+            },
+          },
+        },
+      ],
+    });
     expect(ctx.usersUpdates).toHaveLength(0);
     expect(ctx.moderationActionInserts).toHaveLength(0);
-    expect(console.warn).not.toHaveBeenCalled();
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"shouldWithhold":false'));
+  });
+
+  it("keeps a 200M-token Droid cumulative session fallback record (messages: 1) visible", async () => {
+    const ctx = await submit({
+      aggregates: { totalTokens: 200_000_000, totalCost: "20", inputTokens: 200_000_000, outputTokens: 0 },
+      allDaysSourceBreakdown: {
+        droid: {
+          tokens: 200_000_000,
+          messages: 1,
+          models: {
+            "claude-sonnet-4": {
+              tokens: 200_000_000,
+              messages: 1,
+            },
+          },
+        },
+      },
+    });
+    expect(ctx.usersUpdates).toHaveLength(0);
+    expect(ctx.moderationActionInserts).toHaveLength(0);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"shouldWithhold":false'));
+  });
+
+  it("keeps a count-neutral advisor model fragment (messages: 0) visible alongside a 1-message model under the same client", async () => {
+    const ctx = await submit({
+      aggregates: { totalTokens: 200_000_100, totalCost: "20", inputTokens: 200_000_100, outputTokens: 0 },
+      allDaysSourceBreakdown: {
+        claude: {
+          tokens: 200_000_100,
+          messages: 1,
+          models: {
+            "claude-opus-4": { tokens: 200_000_000, messages: 0 },
+            "claude-sonnet-4": { tokens: 100, messages: 1 },
+          },
+        },
+      },
+    });
+    expect(ctx.usersUpdates).toHaveLength(0);
+    expect(ctx.moderationActionInserts).toHaveLength(0);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"shouldWithhold":false'));
   });
 
   it.each(["admin", "  AdMiN  "])("respects an administrator restore by %s", async (actorUsername) => {

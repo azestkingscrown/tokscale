@@ -11,7 +11,6 @@ import {
 } from "@/lib/validation/submission";
 import {
   evaluateSubmissionForWithholding,
-  getSubmissionWithholdingMode,
   getWithholdingUsageTotals,
 } from "@/lib/moderation/withholding";
 import { authenticatePersonalToken } from "@/lib/auth/personalTokens";
@@ -620,7 +619,6 @@ export async function POST(request: Request) {
       data.contributions,
       isBackfill ? "backfill" : "cli"
     );
-    const withholdingMode = getSubmissionWithholdingMode(process.env.ENABLE_SUBMISSION_AUTOHIDE);
     const result = await db.transaction(async (tx) => {
       await tx
         .update(apiTokens)
@@ -1760,14 +1758,11 @@ export async function POST(request: Request) {
         })
         .where(eq(submissions.id, submissionId));
 
-      // Only final ledger volume can change account state. The default mode
-      // observes decisions without acquiring a user lock or hiding anyone.
-      const withholdingUsage = withholdingMode === "off" ? null : getWithholdingUsageTotals(allDays);
-      const withholdingResult = withholdingUsage
-        ? evaluateSubmissionForWithholding(withholdingUsage)
-        : null;
+      // Only final ledger volume can change account state.
+      const withholdingUsage = getWithholdingUsageTotals(allDays);
+      const withholdingResult = evaluateSubmissionForWithholding(withholdingUsage);
       let autoWithheld = false;
-      if (withholdingMode === "enforce" && withholdingResult?.shouldWithhold) {
+      if (withholdingResult.shouldWithhold) {
         const [currentUser] = await tx
           .select({ leaderboardHidden: users.leaderboardHidden })
           .from(users)
@@ -1872,17 +1867,14 @@ export async function POST(request: Request) {
 
     // Log after commit so failed submissions never look like accepted
     // observations. Include clean decisions to preserve the denominator.
-    if (result.withholdingResult) {
-      console.warn(`[moderation] ${JSON.stringify({
-        event: "submission_withholding_evaluated",
-        ruleVersion: 1,
-        mode: withholdingMode,
-        userId: tokenRecord.userId,
-        ...result.withholdingResult,
-        usage: result.withholdingUsage,
-        applied: result.autoWithheld,
-      })}`);
-    }
+    console.warn(`[moderation] ${JSON.stringify({
+      event: "submission_withholding_evaluated",
+      ruleVersion: 1,
+      userId: tokenRecord.userId,
+      ...result.withholdingResult,
+      usage: result.withholdingUsage,
+      applied: result.autoWithheld,
+    })}`);
 
     // Phase 1 / 1.5 census. Deliberately after the transaction commits, and
     // deliberately unable to affect the response below.

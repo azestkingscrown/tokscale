@@ -213,6 +213,9 @@ describe("getModerationCandidates - moderation action metadata exposure", () => 
     const executedSql = query.sql.replace(/\s+/g, " ");
 
     expect(executedSql).toContain("tokens_per_msg AS (");
+    expect(executedSql).toContain("LOWER(TRIM(client.key)) !~");
+    expect(executedSql).toContain("zero_msg_model_tokens");
+    expect(executedSql).toContain("c.client_tokens > 0 AND COALESCE(m.nested_tokens, 0) > c.client_tokens AS over_nested");
     expect(executedSql).toContain("LEFT JOIN tokens_per_msg tpm ON tpm.submission_id = p.submission_id");
     expect(executedSql).toContain("COALESCE(tpm.max_tokens_per_message, 0) AS max_tokens_per_message");
     expect(executedSql).toMatch(/OR max_tokens_per_message > \$\d+/);

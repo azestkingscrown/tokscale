@@ -113,11 +113,9 @@ describeWithPostgres("submission withholding PostgreSQL integration", () => {
     if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
   });
   beforeEach(() => {
-    vi.stubEnv("ENABLE_SUBMISSION_AUTOHIDE", "1");
     vi.spyOn(console, "warn").mockImplementation(() => {});
   });
   afterEach(() => {
-    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
   afterAll(async () => {
@@ -145,18 +143,6 @@ describeWithPostgres("submission withholding PostgreSQL integration", () => {
     expect(actions).toHaveLength(1);
     expect(actions[0].reason).toBe("Under investigation");
     expect(await signals(a)).toContain("usageLimit");
-  });
-
-  it("observes by default and keeps limit violations available in the review queue", async () => {
-    vi.stubEnv("ENABLE_SUBMISSION_AUTOHIDE", undefined);
-    const a = await account();
-    await submit(a, payload([client("claude", "claude-sonnet-4", tokens(1000, 20_000_000_000), 1000)]));
-    expect(await hidden(a)).toBe(false);
-    expect(await signals(a)).toContain("usageLimit");
-    const sql = database();
-    expect(await sql`SELECT id FROM moderation_actions WHERE target_user_id = ${a.id}`).toHaveLength(0);
-    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"mode":"observe"'));
-    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('"applied":false'));
   });
 
   it("respects an administrator restore on subsequent submissions", async () => {
@@ -216,14 +202,6 @@ describeWithPostgres("submission withholding PostgreSQL integration", () => {
     await submit(a, data);
     expect(await hidden(a)).toBe(false);
     expect(await getModerationHistory(a.id)).toHaveLength(2);
-  });
-
-  it("disables evaluation with the kill switch", async () => {
-    vi.stubEnv("ENABLE_SUBMISSION_AUTOHIDE", "0");
-    const a = await account();
-    await submit(a, payload([client("claude", "claude-sonnet-4", tokens(1000, 20_000_000_000), 1000)]));
-    expect(await hidden(a)).toBe(false);
-    expect(console.warn).not.toHaveBeenCalled();
   });
 
   it("combines same-day device output for both withholding and the review queue", async () => {
@@ -481,14 +459,49 @@ describeWithPostgres("submission withholding PostgreSQL integration", () => {
     expect(action.reason).toBe("Under investigation");
   });
 
-  it("observes physically impossible single-message volume without hiding in observe mode", async () => {
-    vi.stubEnv("ENABLE_SUBMISSION_AUTOHIDE", "observe");
+  it("keeps a 200M-token count-neutral Droid fragment visible alongside a 1-message Codex contribution on the same day or across devices", async () => {
+    const sameDayAccount = await account();
+    await submit(sameDayAccount, payload([
+      client("droid", "claude-sonnet-4", tokens(0, 0, 200_000_000), 20, 0),
+      client("codex", "gpt-5", tokens(100, 0), 0.01, 1),
+    ]));
+    expect(await hidden(sameDayAccount)).toBe(false);
+    expect(await signals(sameDayAccount)).not.toContain("usageLimit");
+    expect(await signals(sameDayAccount)).not.toContain("tokensPerMessage");
+
+    const multiDeviceAccount = await account();
+    await submit(multiDeviceAccount, payload([
+      client("droid", "claude-sonnet-4", tokens(0, 0, 200_000_000), 20, 0),
+    ], { device: "device-1" }));
+    await submit(multiDeviceAccount, payload([
+      client("codex", "gpt-5", tokens(100, 0), 0.01, 1),
+    ], { device: "device-2" }));
+    expect(await hidden(multiDeviceAccount)).toBe(false);
+    expect(await signals(multiDeviceAccount)).not.toContain("usageLimit");
+    expect(await signals(multiDeviceAccount)).not.toContain("tokensPerMessage");
+  });
+
+  it("keeps a 200M-token Droid cumulative session fallback record (messages: 1) visible and out of the per-message review queue", async () => {
     const a = await account();
-    const cs = [client("claude", "claude-sonnet-4", tokens(1_200_000_000, 500), 10, 1)];
-    await submit(a, payload(cs));
+    await submit(a, payload([
+      client("droid", "claude-sonnet-4", tokens(0, 0, 200_000_000), 20, 1),
+    ]));
     expect(await hidden(a)).toBe(false);
-    expect(await signals(a)).toContain("usageLimit");
-    expect(await signals(a)).toContain("tokensPerMessage");
+    expect(await signals(a)).not.toContain("usageLimit");
+    expect(await signals(a)).not.toContain("tokensPerMessage");
+    expect(await getModerationHistory(a.id)).toHaveLength(0);
+  });
+
+  it("keeps a count-neutral advisor model fragment (messages: 0) visible alongside a 1-message model under the same client", async () => {
+    const a = await account();
+    await submit(a, payload([
+      client("claude", "claude-opus-4", tokens(0, 0, 200_000_000), 20, 0),
+      client("claude", "claude-sonnet-4", tokens(100, 0), 0.01, 1),
+    ]));
+    expect(await hidden(a)).toBe(false);
+    expect(await signals(a)).not.toContain("usageLimit");
+    expect(await signals(a)).not.toContain("tokensPerMessage");
+    expect(await getModerationHistory(a.id)).toHaveLength(0);
   });
 
   it("prevents dilution across multiple devices on the same date", async () => {

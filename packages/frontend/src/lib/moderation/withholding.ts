@@ -7,12 +7,58 @@ export const WITHHOLDING_MAX_DAILY_OUTPUT_TOKENS = 10_000_000_000;
 export const WITHHOLDING_MAX_DAILY_TOTAL_TOKENS = 500_000_000_000;
 export const WITHHOLDING_MAX_TOTAL_TOKENS = 1_000_000_000_000_000;
 /**
- * Hard limit for physically impossible single-message token volumes.
+ * Hard limit for physically impossible single-message token volumes on clients
+ * whose exported `messages` count represents individual LLM inferences.
  * Real-world LLM context windows ceiling around 1M-2M tokens (e.g. Gemini 1.5 Pro).
- * A single message reporting 100+ million tokens (or 1+ billion tokens) is
+ * A single inference reporting 100+ million tokens (or 1+ billion tokens) is
  * undeniably fabricated or corrupted.
  */
 export const WITHHOLDING_MAX_TOKENS_PER_MESSAGE = 100_000_000;
+
+/**
+ * Clients whose exported `messages` count is not guaranteed to be a
+ * per-inference counter on every record — e.g. whole-session fallback records
+ * with `messages = 1` (Droid when transcript is missing or exceeds
+ * `MAX_TRANSCRIPT_BYTES`, Zed `cumulative_token_usage` fallback, Vibe session
+ * files, WorkBuddy `session_usage` rows, Kiro session/execution fallbacks),
+ * agent-execution or session-level model summaries (`codebuddy`, `fx`,
+ * `reasonix`, `grok`, `crush`, `warp`), or session reply counts placed on a
+ * single fragment while sibling fragments carry `messages = 0` (`droid`,
+ * `copilot`, `hermes`).
+ *
+ * Daily and lifetime token ceilings still apply to these clients, but dividing
+ * their cumulative token bucket by `messages` does not measure a single LLM
+ * context window.
+ */
+export const NON_PER_INFERENCE_MESSAGE_CLIENTS = [
+  "codebuddy",
+  "copilot",
+  "crush",
+  "devin-desktop",
+  "droid",
+  "fx",
+  "goose",
+  "grok",
+  "hermes",
+  "kiro",
+  "mux",
+  "reasonix",
+  "vibe",
+  "warp",
+  "workbuddy",
+  "zed",
+] as const;
+
+export const NON_PER_INFERENCE_CLIENT_REGEX = `^(${NON_PER_INFERENCE_MESSAGE_CLIENTS.join("|")})$`;
+
+const NON_PER_INFERENCE_MESSAGE_CLIENT_SET: ReadonlySet<string> = new Set(
+  NON_PER_INFERENCE_MESSAGE_CLIENTS
+);
+
+export function hasPerInferenceMessageCount(clientName: string): boolean {
+  const normalized = clientName.trim().toLowerCase();
+  return normalized.length > 0 && !NON_PER_INFERENCE_MESSAGE_CLIENT_SET.has(normalized);
+}
 
 export type WithholdingTrigger =
   | "daily_output_limit"
@@ -39,7 +85,6 @@ export interface WithholdingDailyRow {
   date: string;
   tokens: TokenCount;
   outputTokens: TokenCount;
-  messages?: TokenCount;
   sourceBreakdown?: unknown;
 }
 
@@ -71,11 +116,14 @@ function toTokenCount(value: unknown): number {
   return toCount(value as TokenCount);
 }
 
-/** Group calendar dates across devices using daily_breakdown scalars and evaluate per-message volumes. */
+/**
+ * Group calendar dates across devices using daily_breakdown scalars and
+ * evaluate per-message volumes over matched, per-inference client/model entries.
+ */
 export function getWithholdingUsageTotals(
   rows: readonly WithholdingDailyRow[]
 ): WithholdingUsageTotals {
-  const byDate = new Map<string, { tokens: number; output: number; messages: number }>();
+  const byDate = new Map<string, { tokens: number; output: number }>();
   let totalTokens = 0;
   let maxDailyTokens = 0;
   let maxDailyOutputTokens = 0;
@@ -84,67 +132,85 @@ export function getWithholdingUsageTotals(
   for (const row of rows) {
     const tokens = toCount(row.tokens);
     const output = toCount(row.outputTokens);
-    let rowMessages = toCount(row.messages);
 
-    if (row.sourceBreakdown && typeof row.sourceBreakdown === "object") {
-      let breakdownMessagesSum = 0;
-      for (const clientValue of Object.values(row.sourceBreakdown as Record<string, unknown>)) {
-        if (!clientValue || typeof clientValue !== "object") continue;
+    if (
+      row.sourceBreakdown &&
+      typeof row.sourceBreakdown === "object" &&
+      !Array.isArray(row.sourceBreakdown)
+    ) {
+      for (const [clientKey, clientValue] of Object.entries(
+        row.sourceBreakdown as Record<string, unknown>
+      )) {
+        if (!hasPerInferenceMessageCount(clientKey)) continue;
+        if (!clientValue || typeof clientValue !== "object" || Array.isArray(clientValue)) {
+          continue;
+        }
         const clientObj = clientValue as Record<string, unknown>;
-        const clientTokens = Math.max(toTokenCount(clientObj), toTokenCount(clientObj.tokens));
-        let clientMessages = toCount(clientObj.messages as TokenCount);
-        let modelMessagesSum = 0;
+        const clientTokens = Math.max(
+          toTokenCount(clientObj),
+          toTokenCount(clientObj.tokens)
+        );
+        const clientMessages = toCount(clientObj.messages as TokenCount);
 
-        if (clientObj.models && typeof clientObj.models === "object") {
-          for (const modelValue of Object.values(clientObj.models as Record<string, unknown>)) {
-            if (!modelValue || typeof modelValue !== "object") continue;
+        let modelTokensSum = 0;
+        let zeroMessageModelTokens = 0;
+        let maxModelRatio = 0;
+
+        if (
+          clientObj.models &&
+          typeof clientObj.models === "object" &&
+          !Array.isArray(clientObj.models)
+        ) {
+          for (const modelValue of Object.values(
+            clientObj.models as Record<string, unknown>
+          )) {
+            if (!modelValue || typeof modelValue !== "object" || Array.isArray(modelValue)) {
+              continue;
+            }
             const modelObj = modelValue as Record<string, unknown>;
-            const modelTokens = Math.max(toTokenCount(modelObj), toTokenCount(modelObj.tokens));
+            const modelTokens = Math.max(
+              toTokenCount(modelObj),
+              toTokenCount(modelObj.tokens)
+            );
             const modelMessages = toCount(modelObj.messages as TokenCount);
+            modelTokensSum += modelTokens;
             if (modelMessages > 0) {
-              modelMessagesSum += modelMessages;
               if (modelTokens > 0) {
-                maxTokensPerMessage = Math.max(maxTokensPerMessage, modelTokens / modelMessages);
+                maxModelRatio = Math.max(maxModelRatio, modelTokens / modelMessages);
               }
+            } else {
+              zeroMessageModelTokens += modelTokens;
             }
           }
         }
 
-        if (clientMessages === 0 && modelMessagesSum > 0) {
-          clientMessages = modelMessagesSum;
+        const isOverNested = clientTokens > 0 && modelTokensSum > clientTokens;
+        if (!isOverNested && maxModelRatio > 0) {
+          maxTokensPerMessage = Math.max(maxTokensPerMessage, maxModelRatio);
         }
 
-        if (clientMessages > 0) {
-          breakdownMessagesSum += clientMessages;
-          if (clientTokens > 0) {
-            maxTokensPerMessage = Math.max(maxTokensPerMessage, clientTokens / clientMessages);
+        if (clientMessages > 0 && clientTokens > 0) {
+          const countedClientTokens = isOverNested
+            ? clientTokens
+            : Math.max(0, clientTokens - zeroMessageModelTokens);
+          if (countedClientTokens > 0) {
+            maxTokensPerMessage = Math.max(
+              maxTokensPerMessage,
+              countedClientTokens / clientMessages
+            );
           }
         }
       }
-      if (rowMessages === 0 && breakdownMessagesSum > 0) {
-        rowMessages = breakdownMessagesSum;
-      }
     }
 
-    if (rowMessages > 0 && tokens > 0) {
-      maxTokensPerMessage = Math.max(maxTokensPerMessage, tokens / rowMessages);
-    }
-
-    const day = byDate.get(row.date) ?? { tokens: 0, output: 0, messages: 0 };
+    const day = byDate.get(row.date) ?? { tokens: 0, output: 0 };
     day.tokens += tokens;
     day.output += output;
-    day.messages += rowMessages;
     byDate.set(row.date, day);
 
     totalTokens += tokens;
     maxDailyTokens = Math.max(maxDailyTokens, day.tokens);
     maxDailyOutputTokens = Math.max(maxDailyOutputTokens, day.output);
-  }
-
-  for (const day of byDate.values()) {
-    if (day.messages > 0 && day.tokens > 0) {
-      maxTokensPerMessage = Math.max(maxTokensPerMessage, day.tokens / day.messages);
-    }
   }
 
   return {
@@ -192,15 +258,4 @@ export function evaluateSubmissionForWithholding(
     };
   }
   return { shouldWithhold: false, reason: "" };
-}
-
-export type SubmissionWithholdingMode = "off" | "observe" | "enforce";
-
-/** Explicit opt-in is required to change account state; unset means observe. */
-export function getSubmissionWithholdingMode(
-  value: string | undefined
-): SubmissionWithholdingMode {
-  if (value?.trim() === "0") return "off";
-  if (value?.trim() === "1") return "enforce";
-  return "observe";
 }
